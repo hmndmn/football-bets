@@ -1,7 +1,6 @@
 import os
-from flask import Flask, jsonify
+from flask import Flask
 import pandas as pd
-import requests
 
 from app.sheets import SheetClient
 from app.data_sources import fetch_fixtures, fetch_odds
@@ -15,51 +14,9 @@ app = Flask(__name__)
 def health():
     return "OK", 200
 
-@app.route("/probe_odds")
-def probe_odds():
-    # Directly probe The Odds API so we can see status and headers
-    from app.data_sources import LEAGUE_MAP, ODDS_BASE  # reuse our mapping/base
-    api_key = os.getenv("ODDS_API_KEY", "")
-    leagues = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
-    region = os.getenv("ODDS_REGION", "eu")  # allow override; default 'eu'
-
-    out = {"api_key_present": bool(api_key), "probes": []}
-    for lg in leagues:
-        odds_key = LEAGUE_MAP.get(lg, {}).get("odds_key")
-        if not odds_key:
-            out["probes"].append({"league": lg, "error": "no odds_key"})
-            continue
-        try:
-            r = requests.get(
-                f"{ODDS_BASE}/sports/{odds_key}/odds",
-                params={
-                    "apiKey": api_key,
-                    "regions": region,
-                    "oddsFormat": "decimal",
-                    "markets": "h2h,totals,btts",
-                },
-                timeout=25
-            )
-            try:
-                body = r.json()
-            except Exception:
-                body = None
-            out["probes"].append({
-                "league": lg,
-                "status": r.status_code,
-                "events_len": len(body) if isinstance(body, list) else None,
-                "sample": (body[:1] if isinstance(body, list) and body else r.text[:300]),
-                "headers": {
-                    "x-requests-remaining": r.headers.get("x-requests-remaining"),
-                    "x-requests-used": r.headers.get("x-requests-used"),
-                }
-            })
-        except Exception as e:
-            out["probes"].append({"league": lg, "error": f"EXC: {e}"})
-    return jsonify(out), 200
-
 @app.route("/run")
 def run():
+    # ---- Settings (env vars) ----
     sheet_name   = os.getenv("SHEET_NAME", "Football Picks")
     leagues      = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
     hours_ahead  = int(os.getenv("HOURS_AHEAD", "240"))
@@ -68,14 +25,18 @@ def run():
     bankroll     = float(os.getenv("BANKROLL_START", "500"))
     min_stake    = float(os.getenv("MIN_STAKE_PCT", "0.0025"))
     max_stake    = float(os.getenv("MAX_STAKE_PCT", "0.025"))
+    try:
+        max_picks = int(os.getenv("MAX_PICKS", "0"))
+    except Exception:
+        max_picks = 0
 
     sc = SheetClient(sheet_name)
 
-    # 1) Fixtures + Odds
+    # ---- 1) Fixtures + Odds ----
     fixtures = fetch_fixtures(leagues, hours_ahead=hours_ahead)
     odds     = fetch_odds(fixtures, book_preference=book_pref)
 
-    # 2) Model probabilities per match
+    # ---- 2) Model probabilities per match ----
     model_rows = []
     for _, m in fixtures.iterrows():
         lh, la = predict_match(m["home"], m["away"], m["league"])
@@ -98,14 +59,55 @@ def run():
 
     model_probs = pd.DataFrame(model_rows)
 
-    # 3) Value bets vs odds
+    # ---- 3) Value bets vs odds ----
     picks = find_value_bets(model_probs, odds, edge_threshold=edge_thresh)
 
-    # 4) Staking (Half-Kelly with caps)
+    # ---- 4) Staking (Half-Kelly with caps) ----
     sizer = StakeSizer(bankroll, min_pct=min_stake, max_pct=max_stake)
     picks = sizer.apply(picks)
 
-    # 5) Write to Google Sheets
+    # ---- 4b) Add readable match info; sort; cap ----
+    if not picks.empty:
+        # Merge kickoff/home/away
+        meta = fixtures[["match_id", "league", "utc_kickoff", "home", "away"]].copy()
+        picks = picks.merge(meta, on="match_id", how="left")
+
+        # Human-friendly match name
+        picks["match"] = picks.apply(
+            lambda r: f"{r.get('home','?')} vs {r.get('away','?')}", axis=1
+        )
+
+        # Round stake_amt to whole dollars (keep pct as is)
+        picks["stake_amt"] = picks["stake_amt"].fillna(0).round(0).astype(int)
+
+        # Sort by kickoff (soonest first) then by edge (highest first)
+        picks = picks.sort_values(
+            by=["utc_kickoff", "edge"], ascending=[True, False]
+        ).reset_index(drop=True)
+
+        # Cap number of picks if MAX_PICKS > 0
+        if max_picks and len(picks) > max_picks:
+            picks = picks.head(max_picks).reset_index(drop=True)
+
+        # Reorder columns for readability (keep only those that exist)
+        col_order = [
+            "utc_kickoff","match","market","selection","price","book",
+            "model_prob","implied","edge","stake_pct","stake_amt",
+            "league","home","away","match_id"
+        ]
+        picks = picks[[c for c in col_order if c in picks.columns]]
+
+    # ---- 4c) Build a small summary table ----
+    summary = pd.DataFrame([{
+        "num_picks": int(len(picks)),
+        "total_stake": float(picks["stake_amt"].sum() if not picks.empty else 0.0),
+        "avg_edge": float(picks["edge"].mean() if not picks.empty else 0.0),
+        "bankroll": bankroll,
+        "edge_threshold": edge_thresh,
+        "max_picks": max_picks
+    }])
+
+    # ---- 5) Write to Google Sheets ----
     try:
         if fixtures.empty:
             fixtures = pd.DataFrame(columns=["match_id","league","utc_kickoff","home","away"])
@@ -115,14 +117,16 @@ def run():
             model_probs = pd.DataFrame(columns=["match_id"])
         if picks.empty:
             picks = pd.DataFrame(columns=[
-                "match_id","market","selection","price","book",
-                "model_prob","implied","edge","stake_pct","stake_amt"
+                "utc_kickoff","match","market","selection","price","book",
+                "model_prob","implied","edge","stake_pct","stake_amt",
+                "league","home","away","match_id"
             ])
 
         sc.write_table("fixtures", fixtures)
         sc.write_table("odds", odds)
         sc.write_table("model_probs", model_probs)
         sc.write_table("picks", picks)
+        sc.write_table("summary", summary)
     except Exception as e:
         return f"Error updating sheet: {e}", 500
 
