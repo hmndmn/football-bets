@@ -22,23 +22,37 @@ def check_af_status():
     except Exception as e:
         return (False, f"EXC: {e}")
 
-def af_probe_league(league_id=39, next_n=10):
-    """Return (status_code, text[:1200]) for a simple fixtures call."""
-    try:
-        r = requests.get(
-            f"{AF_BASE}/fixtures",
-            headers=_af_headers(),
-            params={"league": league_id, "next": next_n},
-            timeout=25
-        )
-        return r.status_code, r.text[:1200]
-    except Exception as e:
-        return 0, f"EXC: {e}"
+def af_probe_dates(league_id=39, days=7):
+    """Probe fixtures via from/to date range (free-plan friendly)."""
+    now = datetime.now(timezone.utc)
+    start = now.date().isoformat()
+    end = (now + timedelta(days=days)).date().isoformat()
+    # Try likely seasons (current year, then previous year in case API hasn’t rolled)
+    for season in [now.year, now.year - 1]:
+        try:
+            r = requests.get(
+                f"{AF_BASE}/fixtures",
+                headers=_af_headers(),
+                params={"league": league_id, "season": season, "from": start, "to": end},
+                timeout=25
+            )
+            if r.status_code == 200:
+                return r.status_code, f"season={season} {r.text[:1000]}"
+        except Exception as e:
+            return 0, f"EXC: {e}"
+    return 200, "no data in both seasons"
 
 def fetch_fixtures(leagues, hours_ahead=48):
+    """
+    Return DataFrame: match_id, league, utc_kickoff, home, away
+    Uses API-Football fixtures with 'from'/'to' date range (free plan OK),
+    tries current season, then previous season if needed.
+    """
     rows = []
     now = datetime.now(timezone.utc)
     until = now + timedelta(hours=hours_ahead)
+    start_d = now.date().isoformat()
+    end_d = until.date().isoformat()
 
     for lg in leagues:
         info = LEAGUE_MAP.get(lg)
@@ -46,15 +60,15 @@ def fetch_fixtures(leagues, hours_ahead=48):
             continue
         league_id = info["api_football_id"]
 
-        params_list = [
-            {"league": league_id, "next": 50},
-            {"league": league_id, "season": datetime.now().year, "next": 50},
-        ]
-
         data_accum = []
-        for params in params_list:
+        for season in [now.year, now.year - 1]:
             try:
-                resp = requests.get(f"{AF_BASE}/fixtures", headers=_af_headers(), params=params, timeout=25)
+                resp = requests.get(
+                    f"{AF_BASE}/fixtures",
+                    headers=_af_headers(),
+                    params={"league": league_id, "season": season, "from": start_d, "to": end_d},
+                    timeout=25
+                )
                 if resp.status_code != 200:
                     continue
                 data = resp.json().get("response", [])

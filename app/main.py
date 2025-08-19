@@ -2,7 +2,7 @@ import os
 from flask import Flask
 import pandas as pd
 from app.sheets import SheetClient
-from app.data_sources import fetch_fixtures, fetch_odds, check_af_status, af_probe_league
+from app.data_sources import fetch_fixtures, fetch_odds, check_af_status, af_probe_dates
 
 app = Flask(__name__)
 
@@ -15,11 +15,10 @@ def debug():
     ok, txt = check_af_status()
     return (f"API-Football status ok={ok}\n{txt[:1000]}", 200)
 
-@app.route("/probe")
-def probe():
-    # EPL = 39, LaLiga = 140
-    scode, text = af_probe_league(league_id=39, next_n=10)
-    return (f"fixtures probe status={scode}\n{text}", 200)
+@app.route("/probe_dates")
+def probe_dates():
+    scode, text = af_probe_dates(league_id=39, days=10)  # EPL example
+    return (f"fixtures probe (from/to) status={scode}\n{text}", 200)
 
 @app.route("/run")
 def run():
