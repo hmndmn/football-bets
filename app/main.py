@@ -1,7 +1,7 @@
 import os
-from flask import Flask, render_template, request
 import pandas as pd
 from zoneinfo import ZoneInfo
+from flask import Flask, render_template, request
 
 from app.sheets import SheetClient
 from app.data_sources import fetch_fixtures, fetch_odds
@@ -15,6 +15,10 @@ app = Flask(__name__)
 def health():
     return "OK", 200
 
+
+# ------------------------
+# Helpers
+# ------------------------
 def _add_local_time(df: pd.DataFrame, utc_col: str = "utc_kickoff", local_col: str = "kickoff_local"):
     """Add a Vancouver local time string column based on an ISO UTC kickoff column."""
     if df.empty or utc_col not in df.columns:
@@ -24,10 +28,11 @@ def _add_local_time(df: pd.DataFrame, utc_col: str = "utc_kickoff", local_col: s
     df[local_col] = local.dt.strftime("%Y-%m-%d %H:%M (%Z)")
     return df
 
+
 def _selection_with_team(row):
     """
     For 1X2: map Home/Away to actual team names; keep Draw as Draw.
-    For others (OU etc.), keep the original selection.
+    For other markets (OU etc.), keep the original selection.
     """
     sel = str(row.get("selection", ""))
     mkt = str(row.get("market", ""))
@@ -39,6 +44,10 @@ def _selection_with_team(row):
         return "Draw"
     return sel
 
+
+# ------------------------
+# Core run endpoint
+# ------------------------
 @app.route("/run")
 def run():
     # ---- Settings (env vars) ----
@@ -108,7 +117,7 @@ def run():
         # Replace Home/Away with team name for 1X2
         picks["selection_name"] = picks.apply(_selection_with_team, axis=1)
 
-        # A compact label that includes odds, e.g. "Osasuna @ 14.00"
+        # Optional compact label like "Osasuna @ 14.00"
         def _pick_label(r):
             sel = r.get("selection_name") or r.get("selection")
             try:
@@ -182,6 +191,10 @@ def run():
         200
     )
 
+
+# ------------------------
+# Read/Filter view endpoint
+# ------------------------
 @app.route("/view")
 def view_picks():
     """Read 'picks' from Google Sheets and render a clean HTML table with filters."""
@@ -192,16 +205,16 @@ def view_picks():
     except Exception as e:
         return f"Error reading sheet: {e}", 500
 
-    # Try numeric types
+    # Numeric casting for display/filtering
     for c in ["price","model_prob","implied","edge","stake_amt"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # --------- Filters (via query string) ----------
     # Example: /view?min_edge=0.08&market=OU&league=EPL&book=bet365
-    q_market   = (request.args.get("market") or "").strip()       # "1X2", "OU" (prefix), etc.
+    q_market   = (request.args.get("market") or "").strip()       # "1X2" or "OU" (prefix)
     q_league   = (request.args.get("league") or "").strip()       # "EPL", "LaLiga"
-    q_book     = (request.args.get("book") or "").strip()         # e.g., "bet365"
+    q_book     = (request.args.get("book") or "").strip()         # bookmaker name
     q_min_edge = request.args.get("min_edge")
     q_min_prob = request.args.get("min_prob")
 
@@ -236,14 +249,15 @@ def view_picks():
         sort_cols = ["kickoff_local","edge"] if "kickoff_local" in df.columns else ["utc_kickoff","edge"]
         df = df.sort_values(by=sort_cols, ascending=[True, False])
 
-    # Columns to show
+    # Columns to show in the template
     cols = [c for c in [
         "kickoff_local","league","match","market",
-        "selection_name","price","book","model_prob","implied","edge","stake_amt"
+        "selection_name","price","book","model_prob","implied","edge","stake_amt",
+        "utc_kickoff"  # kept as fallback, not displayed if local exists
     ] if c in df.columns]
     df = df[cols] if cols else df
 
-    # Render
+    # Render with 'rows' and 'qs' for the template
     return render_template(
         "picks.html",
         rows=df.to_dict(orient="records"),
@@ -255,6 +269,7 @@ def view_picks():
             "min_prob": q_min_prob or ""
         }
     )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
