@@ -1,7 +1,7 @@
 import os
 from flask import Flask
 import pandas as pd
-from sheets import SheetClient
+from app.sheets import SheetClient
 
 app = Flask(__name__)
 
