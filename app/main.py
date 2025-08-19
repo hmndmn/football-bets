@@ -1,65 +1,73 @@
-import math
-import numpy as np
+import os, math
+from flask import Flask, jsonify
 import pandas as pd
 
-# Starter model: neutral Poisson with small home advantage baked into baselines.
-# We'll upgrade later with team strengths and injury adjustments.
+from app.data_sources import fetch_fixtures, fetch_odds
+from app.model import market_probs
+from app.markets import find_value_bets
+from app.staking import stake_plan
+from app.sheets import SheetClient
 
-BASE_HOME_XG = 1.45
-BASE_AWAY_XG = 1.25
+app = Flask(__name__)
 
-def predict_match(home: str, away: str, league: str):
-    """
-    Returns (lambda_home, lambda_away) expected goals.
-    """
-    lam_home = max(0.4, BASE_HOME_XG)
-    lam_away = max(0.4, BASE_AWAY_XG)
-    return float(lam_home), float(lam_away)
+@app.route("/")
+def root():
+    return "OK", 200
 
-def poisson_pmf(lam, k):
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+@app.route("/probe")
+def probe():
+    leagues = ["EPL"]
+    fixtures = fetch_fixtures(leagues)
+    odds = fetch_odds(fixtures)
+    return jsonify({
+        "fixtures": len(fixtures),
+        "odds_rows": len(odds)
+    })
 
-def score_matrix(lh, la, maxg=7):
-    ph = np.array([poisson_pmf(lh, k) for k in range(maxg + 1)])
-    pa = np.array([poisson_pmf(la, k) for k in range(maxg + 1)])
-    return np.outer(ph, pa)  # P(home=i, away=j)
+@app.route("/run")
+def run():
+    leagues = ["EPL"]
+    fixtures = fetch_fixtures(leagues)
+    odds = fetch_odds(fixtures)
 
-def market_probs(lh, la, maxg=7, ou_lines=(2.5,)):
-    """
-    Compute probabilities for 1X2, BTTS, and specified OU lines.
-    Returns dict of probabilities.
-    """
-    M = score_matrix(lh, la, maxg=maxg)
-    home = np.tril(M, -1).sum()
-    draw = np.trace(M)
-    away = np.triu(M, 1).sum()
+    picks = []
+    for _, f in fixtures.iterrows():
+        mid = f["match_id"]
+        home, away = f["home"], f["away"]
+        match_odds = odds[odds.match_id == mid]
 
-    # BTTS
-    p_home0 = M[0, :].sum()
-    p_away0 = M[:, 0].sum()
-    p00 = M[0, 0]
-    btts_yes = 1 - p_home0 - p_away0 + p00
-
-    out = {
-        "p_H": float(home),
-        "p_D": float(draw),
-        "p_A": float(away),
-        "p_BTTS_Yes": float(btts_yes),
-        "p_BTTS_No": float(1 - btts_yes),
-    }
-
-    # Over/Under lines
-    for L in ou_lines:
-        try:
-            Lf = float(L)
-        except Exception:
+        # Model probabilities (only if both odds and teams exist)
+        if match_odds.empty:
             continue
-        over = 0.0
-        for i in range(maxg + 1):
-            for j in range(maxg + 1):
-                if (i + j) > Lf:  # e.g., > 2.5 means 3+
-                    over += M[i, j]
-        out[f"p_OU{Lf}_Over"] = float(over)
-        out[f"p_OU{Lf}_Under"] = float(1 - over)
 
-    return out
+        lh, la = 1.4, 1.0  # placeholder lambda values
+        ou_lines = [2.5]
+
+        probs = market_probs(lh, la, ou_lines=tuple(ou_lines))
+        values = find_value_bets(probs, match_odds)
+        stakes = stake_plan(values)
+
+        for row in stakes:
+            picks.append({
+                "match": f"{home} vs {away}",
+                "market": row["market"],
+                "selection": row["selection"],
+                "odds": row["odds"],
+                "model_prob": row["model_prob"],
+                "stake": row["stake"],
+            })
+
+    df = pd.DataFrame(picks)
+
+    # Write to Google Sheets if available
+    if not df.empty and os.environ.get("GOOGLE_SA_JSON_BASE64"):
+        try:
+            sc = SheetClient("Football Bets")
+            sc.write_table("Picks", df)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    return jsonify({"count": len(df), "picks": df.to_dict(orient="records")})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
