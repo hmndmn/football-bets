@@ -49,9 +49,9 @@ def fetch_fixtures(leagues, hours_ahead=240):
             f"{ODDS_BASE}/sports/{odds_key}/odds",
             params={
                 "apiKey": key,
-                "regions": "eu",
+                "regions": os.getenv("ODDS_REGION", "eu"),
                 "oddsFormat": "decimal",
-                "markets": "h2h,totals,btts",   # BTTS included
+                "markets": "h2h,totals",   # BTTS not supported by this endpoint
             },
             timeout=25
         )
@@ -81,7 +81,7 @@ def fetch_fixtures(leagues, hours_ahead=240):
 
 def fetch_odds(fixtures_df, book_preference="bet365"):
     """
-    Collect odds for our fixtures (1X2, Totals, BTTS).
+    Collect odds for our fixtures (1X2 and Totals).
     - Normalizes h2h selections to 'Home'/'Away'/'Draw' using event team names.
     Returns: match_id, market, selection, price, book
     """
@@ -100,9 +100,9 @@ def fetch_odds(fixtures_df, book_preference="bet365"):
             f"{ODDS_BASE}/sports/{odds_key}/odds",
             params={
                 "apiKey": key,
-                "regions": "eu",
+                "regions": os.getenv("ODDS_REGION", "eu"),
                 "oddsFormat": "decimal",
-                "markets": "h2h,totals,btts",   # BTTS included
+                "markets": "h2h,totals",   # keep to supported markets
             },
             timeout=25
         )
@@ -171,19 +171,14 @@ def fetch_odds(fixtures_df, book_preference="bet365"):
                                     "book": bk.get("title","")
                                 })
 
-                    elif keym == "btts":
-                        # Selections usually "Yes" / "No"
-                        for o in outs:
-                            name = o.get("name")    # "Yes" / "No"
-                            price = o.get("price")
-                            if name and price:
-                                rows.append({
-                                    "match_id": mid,
-                                    "market": "BTTS",
-                                    "selection": name,
-                                    "price": float(price),
-                                    "book": bk.get("title","")
-                                })
+                    # NOTE: 'btts' is not a valid market on this endpoint.
+                    # If The Odds API adds it later, this block would parse it:
+                    # elif keym == "btts":
+                    #     for o in outs:
+                    #         name = o.get("name")    # "Yes" / "No"
+                    #         price = o.get("price")
+                    #         if name and price:
+                    #             rows.append({...})
 
     df = pd.DataFrame(rows)
     if df.empty:
