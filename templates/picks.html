@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Football Picks</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1 { font-size: 22px; margin: 0 0 16px; }
+    form.filters { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin: 0 0 16px; }
+    form.filters input, form.filters select { padding:6px 8px; border:1px solid #ddd; border-radius:6px; }
+    form.filters button { padding:6px 10px; border:1px solid #333; background:#111; color:#fff; border-radius:6px; cursor:pointer; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid #eee; text-align: left; }
+    th { background: #fafafa; position: sticky; top: 0; }
+    tr:hover { background: #f8f9fb; }
+    .num { text-align: right; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; font-size:12px; }
+    .edge-pos { color:#0a7a27; font-weight:600; }
+    .edge-neg { color:#b00020; font-weight:600; }
+  </style>
+</head>
+<body>
+  <h1>Football Picks</h1>
+
+  <form class="filters" method="get">
+    <label>
+      Market:
+      <select name="market">
+        <option value="" {{ 'selected' if not qs.market }}>All</option>
+        <option value="1X2" {{ 'selected' if qs.market=='1X2' }}>1X2</option>
+        <option value="OU"  {{ 'selected' if qs.market=='OU'  }}>Over/Under</option>
+      </select>
+    </label>
+
+    <label>
+      League:
+      <select name="league">
+        <option value="" {{ 'selected' if not qs.league }}>All</option>
+        <option value="EPL" {{ 'selected' if qs.league=='EPL' }}>EPL</option>
+        <option value="LaLiga" {{ 'selected' if qs.league=='LaLiga' }}>LaLiga</option>
+      </select>
+    </label>
+
+    <label>
+      Book:
+      <input type="text" name="book" value="{{ qs.book or '' }}" placeholder="bet365, Unibet, ..." />
+    </label>
+
+    <label>
+      Min Edge:
+      <input type="number" step="0.01" name="min_edge" value="{{ qs.min_edge or '' }}" placeholder="0.08" />
+    </label>
+
+    <label>
+      Min Model Prob:
+      <input type="number" step="0.01" name="min_prob" value="{{ qs.min_prob or '' }}" placeholder="0.20" />
+    </label>
+
+    <button type="submit">Apply</button>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Kickoff (Local)</th>
+        <th>League</th>
+        <th>Match</th>
+        <th>Market</th>
+        <th>Pick</th>
+        <th class="num">Odds (Dec)</th>
+        <th>Book</th>
+        <th class="num">Model %</th>
+        <th class="num">Implied %</th>
+        <th class="num">Edge %</th>
+        <th class="num">Stake</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      {% set model = r.get('model_prob') or 0 %}
+      {% set implied = r.get('implied') or 0 %}
+      {% set edge = r.get('edge') or 0 %}
+      <tr>
+        <td>{{ r.get('kickoff_local') or r.get('utc_kickoff') }}</td>
+        <td><span class="pill">{{ r.get('league','') }}</span></td>
+        <td>{{ r.get('match','') }}</td>
+        <td>{{ r.get('market','') }}</td>
+        <td>{{ r.get('selection_name') or r.get('selection') }}</td>
+        <td class="num">{{ "%.2f"|format(r.get('price',0) or 0) }}</td>
+        <td>{{ r.get('book','') }}</td>
+        <td class="num">{{ "%.1f"|format(100*model) }}</td>
+        <td class="num">{{ "%.1f"|format(100*implied) }}</td>
+        <td class="num {{ 'edge-pos' if edge >= 0 else 'edge-neg' }}">{{ "%.1f"|format(100*edge) }}</td>
+        <td class="num">${{ "%d"|format(int(r.get('stake_amt') or 0)) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
