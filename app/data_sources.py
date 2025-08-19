@@ -16,12 +16,24 @@ def _af_headers():
     return {"x-apisports-key": key} if key else {}
 
 def check_af_status():
-    """Return (ok, text) from API-Football /status to confirm key works."""
     try:
         r = requests.get(f"{AF_BASE}/status", headers=_af_headers(), timeout=20)
         return (r.status_code == 200, r.text)
     except Exception as e:
         return (False, f"EXC: {e}")
+
+def af_probe_league(league_id=39, next_n=10):
+    """Return (status_code, text[:1200]) for a simple fixtures call."""
+    try:
+        r = requests.get(
+            f"{AF_BASE}/fixtures",
+            headers=_af_headers(),
+            params={"league": league_id, "next": next_n},
+            timeout=25
+        )
+        return r.status_code, r.text[:1200]
+    except Exception as e:
+        return 0, f"EXC: {e}"
 
 def fetch_fixtures(leagues, hours_ahead=48):
     rows = []
@@ -40,22 +52,17 @@ def fetch_fixtures(leagues, hours_ahead=48):
         ]
 
         data_accum = []
-        last_err = None
         for params in params_list:
             try:
                 resp = requests.get(f"{AF_BASE}/fixtures", headers=_af_headers(), params=params, timeout=25)
                 if resp.status_code != 200:
-                    last_err = f"fixtures {lg} {params} -> {resp.status_code} {resp.text[:300]}"
                     continue
                 data = resp.json().get("response", [])
                 if data:
                     data_accum = data
                     break
-            except Exception as e:
-                last_err = f"fixtures {lg} EXC {e}"
-
-        if not data_accum and last_err:
-            print(last_err)
+            except Exception:
+                continue
 
         for m in data_accum:
             fx = m.get("fixture", {}) or {}
@@ -99,11 +106,9 @@ def fetch_odds(fixtures_df, book_preference="bet365"):
                 timeout=25
             )
             if resp.status_code != 200:
-                print(f"odds {lg} -> {resp.status_code} {resp.text[:300]}")
                 continue
             events = resp.json()
-        except Exception as e:
-            print(f"odds {lg} EXC {e}")
+        except Exception:
             continue
 
         def norm(s): return s.strip().lower() if isinstance(s, str) else s
