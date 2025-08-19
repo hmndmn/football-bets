@@ -15,41 +15,46 @@ def health():
 
 @app.route("/run")
 def run():
-    sheet_name = os.getenv("SHEET_NAME", "Football Picks")
-    leagues = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
-    hours_ahead = int(os.getenv("HOURS_AHEAD", "240"))
-    book_pref = os.getenv("BOOK_FILTER", "bet365")
-    edge_threshold = float(os.getenv("EDGE_THRESHOLD", "0.05"))
-    bankroll = float(os.getenv("BANKROLL_START", "500"))
-    min_stake = float(os.getenv("MIN_STAKE_PCT", "0.0025"))
-    max_stake = float(os.getenv("MAX_STAKE_PCT", "0.025"))
+    sheet_name   = os.getenv("SHEET_NAME", "Football Picks")
+    leagues      = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
+    hours_ahead  = int(os.getenv("HOURS_AHEAD", "240"))
+    book_pref    = os.getenv("BOOK_FILTER", "bet365")
+    edge_thresh  = float(os.getenv("EDGE_THRESHOLD", "0.05"))
+    bankroll     = float(os.getenv("BANKROLL_START", "500"))
+    min_stake    = float(os.getenv("MIN_STAKE_PCT", "0.0025"))
+    max_stake    = float(os.getenv("MAX_STAKE_PCT", "0.025"))
 
     sc = SheetClient(sheet_name)
 
     # 1) Fixtures + Odds
     fixtures = fetch_fixtures(leagues, hours_ahead=hours_ahead)
-    odds = fetch_odds(fixtures, book_preference=book_pref)
+    odds     = fetch_odds(fixtures, book_preference=book_pref)
 
     # 2) Model probabilities per match
     model_rows = []
     for _, m in fixtures.iterrows():
         lh, la = predict_match(m["home"], m["away"], m["league"])
-        # collect OU lines present in odds for this match (e.g., 2.5, 3.0) to compute both
+
+        # Collect OU lines present in odds for this match (e.g., 2.5, 3.0) so we compute the same lines
         ou_lines = []
         if not odds.empty:
-            for line in (odds[odds["match_id"] == m["match_id"]]["market"].unique() or []):
-                if str(line).startswith("OU"):
+            lines = odds.loc[odds["match_id"] == m["match_id"], "market"].unique()
+            for line in lines:
+                s = str(line)
+                if s.startswith("OU"):
                     try:
-                        ou_lines.append(float(str(line)[2:]))
+                        ou_lines.append(float(s[2:]))
                     except Exception:
                         pass
-        ou_lines = sorted(set(ou_lines)) or (2.5,)
+        ou_lines = sorted(set(ou_lines)) if ou_lines else [2.5]
+
         probs = market_probs(lh, la, ou_lines=tuple(ou_lines))
         model_rows.append({"match_id": m["match_id"], **probs})
+
     model_probs = pd.DataFrame(model_rows)
 
     # 3) Value bets vs odds
-    picks = find_value_bets(model_probs, odds, edge_threshold=edge_threshold)
+    picks = find_value_bets(model_probs, odds, edge_threshold=edge_thresh)
 
     # 4) Staking
     sizer = StakeSizer(bankroll, min_pct=min_stake, max_pct=max_stake)
@@ -64,7 +69,10 @@ def run():
         if model_probs.empty:
             model_probs = pd.DataFrame(columns=["match_id"])
         if picks.empty:
-            picks = pd.DataFrame(columns=["match_id","market","selection","price","book","model_prob","implied","edge","stake_pct","stake_amt"])
+            picks = pd.DataFrame(columns=[
+                "match_id","market","selection","price","book",
+                "model_prob","implied","edge","stake_pct","stake_amt"
+            ])
 
         sc.write_table("fixtures", fixtures)
         sc.write_table("odds", odds)
@@ -73,7 +81,13 @@ def run():
     except Exception as e:
         return f"Error updating sheet: {e}", 500
 
-    return f"OK fixtures={len(fixtures)} odds_rows={len(odds)} model_rows={len(model_probs)} picks={len(picks)}", 200
+    return (
+        f"OK fixtures={len(fixtures)} "
+        f"odds_rows={len(odds)} "
+        f"model_rows={len(model_probs)} "
+        f"picks={len(picks)}",
+        200
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
