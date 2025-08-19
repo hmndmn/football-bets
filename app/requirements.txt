@@ -1,0 +1,9 @@
+requests
+pandas
+numpy
+flask
+gunicorn
+gspread
+google-auth
+python-dotenv
+pytz
