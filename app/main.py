@@ -1,6 +1,8 @@
 import os
-from flask import Flask
+from flask import Flask, jsonify
 import pandas as pd
+import requests
+
 from app.sheets import SheetClient
 from app.data_sources import fetch_fixtures, fetch_odds
 from app.model import predict_match, market_probs
@@ -12,6 +14,49 @@ app = Flask(__name__)
 @app.route("/")
 def health():
     return "OK", 200
+
+@app.route("/probe_odds")
+def probe_odds():
+    # Directly probe The Odds API so we can see status and headers
+    from app.data_sources import LEAGUE_MAP, ODDS_BASE  # reuse our mapping/base
+    api_key = os.getenv("ODDS_API_KEY", "")
+    leagues = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
+    region = os.getenv("ODDS_REGION", "eu")  # allow override; default 'eu'
+
+    out = {"api_key_present": bool(api_key), "probes": []}
+    for lg in leagues:
+        odds_key = LEAGUE_MAP.get(lg, {}).get("odds_key")
+        if not odds_key:
+            out["probes"].append({"league": lg, "error": "no odds_key"})
+            continue
+        try:
+            r = requests.get(
+                f"{ODDS_BASE}/sports/{odds_key}/odds",
+                params={
+                    "apiKey": api_key,
+                    "regions": region,
+                    "oddsFormat": "decimal",
+                    "markets": "h2h,totals,btts",
+                },
+                timeout=25
+            )
+            try:
+                body = r.json()
+            except Exception:
+                body = None
+            out["probes"].append({
+                "league": lg,
+                "status": r.status_code,
+                "events_len": len(body) if isinstance(body, list) else None,
+                "sample": (body[:1] if isinstance(body, list) and body else r.text[:300]),
+                "headers": {
+                    "x-requests-remaining": r.headers.get("x-requests-remaining"),
+                    "x-requests-used": r.headers.get("x-requests-used"),
+                }
+            })
+        except Exception as e:
+            out["probes"].append({"league": lg, "error": f"EXC: {e}"})
+    return jsonify(out), 200
 
 @app.route("/run")
 def run():
