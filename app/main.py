@@ -1,61 +1,93 @@
-import math
-import numpy as np
+import os
+from flask import Flask
 import pandas as pd
+from app.sheets import SheetClient
+from app.data_sources import fetch_fixtures, fetch_odds
+from app.model import predict_match, market_probs
+from app.markets import find_value_bets
+from app.staking import StakeSizer
 
-# Starter model: neutral Poisson with small home advantage baked into baselines.
-BASE_HOME_XG = 1.45
-BASE_AWAY_XG = 1.25
+app = Flask(__name__)
 
-def predict_match(home: str, away: str, league: str):
-    """Return (lambda_home, lambda_away) expected goals."""
-    lam_home = max(0.4, BASE_HOME_XG)
-    lam_away = max(0.4, BASE_AWAY_XG)
-    return float(lam_home), float(lam_away)
+@app.route("/")
+def health():
+    return "OK", 200
 
-def poisson_pmf(lam, k):
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+@app.route("/run")
+def run():
+    sheet_name   = os.getenv("SHEET_NAME", "Football Picks")
+    leagues      = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
+    hours_ahead  = int(os.getenv("HOURS_AHEAD", "240"))
+    book_pref    = os.getenv("BOOK_FILTER", "bet365")
+    edge_thresh  = float(os.getenv("EDGE_THRESHOLD", "0.05"))
+    bankroll     = float(os.getenv("BANKROLL_START", "500"))
+    min_stake    = float(os.getenv("MIN_STAKE_PCT", "0.0025"))
+    max_stake    = float(os.getenv("MAX_STAKE_PCT", "0.025"))
 
-def score_matrix(lh, la, maxg=7):
-    ph = np.array([poisson_pmf(lh, k) for k in range(maxg + 1)])
-    pa = np.array([poisson_pmf(la, k) for k in range(maxg + 1)])
-    return np.outer(ph, pa)  # P(home=i, away=j)
+    sc = SheetClient(sheet_name)
 
-def market_probs(lh, la, maxg=7, ou_lines=(2.5,)):
-    """
-    Compute probabilities for 1X2, BTTS, and specified OU lines.
-    Returns dict of probabilities.
-    """
-    M = score_matrix(lh, la, maxg=maxg)
-    home = np.tril(M, -1).sum()
-    draw = np.trace(M)
-    away = np.triu(M, 1).sum()
+    # 1) Fixtures + Odds
+    fixtures = fetch_fixtures(leagues, hours_ahead=hours_ahead)
+    odds     = fetch_odds(fixtures, book_preference=book_pref)
 
-    # BTTS
-    p_home0 = M[0, :].sum()
-    p_away0 = M[:, 0].sum()
-    p00 = M[0, 0]
-    btts_yes = 1 - p_home0 - p_away0 + p00
+    # 2) Model probabilities per match
+    model_rows = []
+    for _, m in fixtures.iterrows():
+        lh, la = predict_match(m["home"], m["away"], m["league"])
 
-    out = {
-        "p_H": float(home),
-        "p_D": float(draw),
-        "p_A": float(away),
-        "p_BTTS_Yes": float(btts_yes),
-        "p_BTTS_No": float(1 - btts_yes),
-    }
+        # Collect OU lines present in odds for this match (e.g., 2.5, 3.0)
+        ou_lines = []
+        if not odds.empty:
+            lines = odds.loc[odds["match_id"] == m["match_id"], "market"].unique()
+            for line in lines:
+                s = str(line)
+                if s.startswith("OU"):
+                    try:
+                        ou_lines.append(float(s[2:]))
+                    except Exception:
+                        pass
+        ou_lines = sorted(set(ou_lines)) if ou_lines else [2.5]
 
-    # Over/Under lines
-    for L in ou_lines:
-        try:
-            Lf = float(L)
-        except Exception:
-            continue
-        over = 0.0
-        for i in range(maxg + 1):
-            for j in range(maxg + 1):
-                if (i + j) > Lf:  # e.g., > 2.5 means 3+
-                    over += M[i, j]
-        out[f"p_OU{Lf}_Over"] = float(over)
-        out[f"p_OU{Lf}_Under"] = float(1 - over)
+        probs = market_probs(lh, la, ou_lines=tuple(ou_lines))
+        model_rows.append({"match_id": m["match_id"], **probs})
 
-    return out
+    model_probs = pd.DataFrame(model_rows)
+
+    # 3) Value bets vs odds
+    picks = find_value_bets(model_probs, odds, edge_threshold=edge_thresh)
+
+    # 4) Staking (Half-Kelly with caps)
+    sizer = StakeSizer(bankroll, min_pct=min_stake, max_pct=max_stake)
+    picks = sizer.apply(picks)
+
+    # 5) Write to Google Sheets
+    try:
+        if fixtures.empty:
+            fixtures = pd.DataFrame(columns=["match_id","league","utc_kickoff","home","away"])
+        if odds.empty:
+            odds = pd.DataFrame(columns=["match_id","market","selection","price","book"])
+        if model_probs.empty:
+            model_probs = pd.DataFrame(columns=["match_id"])
+        if picks.empty:
+            picks = pd.DataFrame(columns=[
+                "match_id","market","selection","price","book",
+                "model_prob","implied","edge","stake_pct","stake_amt"
+            ])
+
+        sc.write_table("fixtures", fixtures)
+        sc.write_table("odds", odds)
+        sc.write_table("model_probs", model_probs)
+        sc.write_table("picks", picks)
+    except Exception as e:
+        return f"Error updating sheet: {e}", 500
+
+    return (
+        f"OK fixtures={len(fixtures)} "
+        f"odds_rows={len(odds)} "
+        f"model_rows={len(model_probs)} "
+        f"picks={len(picks)}",
+        200
+    )
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
