@@ -5,18 +5,18 @@ from datetime import datetime, timezone, timedelta
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 
-# Friendly -> The Odds API sport keys (corrected)
+# Friendly -> The Odds API sport keys (correct)
 SPORT_KEYS = {
     "EPL":        "soccer_epl",
     "LaLiga":     "soccer_spain_la_liga",
     "SerieA":     "soccer_italy_serie_a",
     "Bundesliga": "soccer_germany_bundesliga",
-    "Ligue1":     "soccer_france_ligue_1",           # fixed
-    "UCL":        "soccer_uefa_champions_league",    # fixed
+    "Ligue1":     "soccer_france_ligue_1",
+    "UCL":        "soccer_uefa_champions_league",
 }
 
-REGIONS = os.getenv("ODDS_REGIONS", "uk,eu,us")      # broaden coverage
-ODDS_FORMAT = "decimal"                               # we want decimal odds
+REGIONS = os.getenv("ODDS_REGIONS", "uk,eu,us")      # Broaden coverage
+ODDS_FORMAT = "decimal"                               # Decimal odds
 
 
 def _fetch_odds_for_sport(sport_key: str) -> list:
@@ -51,10 +51,7 @@ def _within_hours(commence_iso: str | None, hours_ahead: int) -> bool:
     if not commence_iso:
         return False
     try:
-        # API returns ISO with Z; pandas can parse but we do it manually here
-        dt = datetime.fromisoformat(
-            commence_iso.replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(commence_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
         now = datetime.now(timezone.utc)
         return now <= dt <= now + timedelta(hours=hours_ahead)
     except Exception:
@@ -102,7 +99,9 @@ def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365", hours_ah
       - H2H -> market='1X2', selection in {'Home','Draw','Away'}
       - Totals -> market='OU{line}', selection in {'Over','Under'}
       - Spreads -> market='AH', selection = team name, plus side ('home'/'away') and line (float)
-    We keep the SINGLE BEST price across ALL books per (match, market, selection[, side, line]).
+
+    IMPORTANT: We DO NOT re-filter by time here. We trust the fixtures list already
+    limited the window, so we only include events whose match_id appears in fixtures.
     """
     if fixtures.empty:
         return pd.DataFrame(columns=["match_id", "market", "selection", "price", "book", "side", "line"])
@@ -112,7 +111,7 @@ def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365", hours_ah
 
     odds_rows: list[dict] = []
 
-    # Fetch each league once; only keep events we have in fixtures and in the time window
+    # Fetch each league once; only keep events in fixtures
     for lg in leagues:
         sport_key = SPORT_KEYS.get(lg)
         if not sport_key:
@@ -122,8 +121,6 @@ def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365", hours_ah
         for ev in events or []:
             match_id = ev.get("id")
             if match_id not in wanted_ids:
-                continue
-            if not _within_hours(ev.get("commence_time"), hours_ahead):
                 continue
 
             home = ev.get("home_team")
@@ -147,7 +144,6 @@ def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365", hours_ah
                             elif str(name).lower() == "draw":
                                 sel = "Draw"
                             else:
-                                # skip unknown labels to avoid dupy noise
                                 continue
                             odds_rows.append({
                                 "match_id": match_id,
@@ -169,7 +165,7 @@ def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365", hours_ah
                                 L = float(line)
                             except Exception:
                                 continue
-                            nm = str(name).capitalize()  # Over/Under normalized
+                            nm = str(name).capitalize()  # Over / Under
                             if nm not in ("Over", "Under"):
                                 continue
                             odds_rows.append({
