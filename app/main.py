@@ -10,19 +10,18 @@ from app.model import predict_match, market_probs
 from app.markets import find_value_bets
 from app.staking import StakeSizer
 
-# Google Sheets is optional now
+# Sheets are optional now (can be re-enabled with USE_SHEETS=true)
 USE_SHEETS = os.getenv("USE_SHEETS", "false").lower() in ("1", "true", "yes")
-
 if USE_SHEETS:
     try:
-        from app.sheets import SheetClient  # will error if creds invalid
+        from app.sheets import SheetClient  # may fail if creds not present/valid
     except Exception:
         SheetClient = None
         USE_SHEETS = False
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# Where we persist latest picks on the server (so /view works without Sheets)
+# Persisted data for /view (so we don't rely on Sheets)
 DATA_DIR = Path("/opt/render/project/src/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PICKS_JSON = DATA_DIR / "latest_picks.json"
@@ -31,9 +30,7 @@ SUMMARY_JSON = DATA_DIR / "latest_summary.json"
 def df_to_json_records(df: pd.DataFrame):
     if df is None or df.empty:
         return []
-    # replace non-finite with None so JSON is valid
     safe = df.replace([float("inf"), float("-inf")], pd.NA).fillna(value=pd.NA)
-    # convert to pure python types
     return json.loads(safe.to_json(orient="records", date_format="iso"))
 
 @app.route("/")
@@ -67,7 +64,7 @@ def run():
     min_stake    = float(os.getenv("MIN_STAKE_PCT", "0.0025"))
     max_stake    = float(os.getenv("MAX_STAKE_PCT", "0.025"))
     max_picks    = int(os.getenv("MAX_PICKS", "50"))
-    book_pref    = os.getenv("BOOK_FILTER", "")  # optional filter by book name
+    book_pref    = os.getenv("BOOK_FILTER", "")  # optional book filter
 
     # Fetch fixtures & odds
     fixtures_df = fetch_fixtures(leagues=leagues, hours_ahead=hours_ahead)
@@ -76,18 +73,21 @@ def run():
     fixtures_ct = len(fixtures_df) if fixtures_df is not None else 0
     odds_ct     = len(odds_df) if odds_df is not None else 0
 
-    # Basic model: for each fixture, compute market probabilities
+    # Model probs
     model_rows = []
     if fixtures_ct > 0:
         for _, f in fixtures_df.iterrows():
             lh, la = predict_match(f["home"], f["away"], f["league"])
-            # collect OU lines available from odds for this match (if any)
+            # OU lines from odds for this match, if present
             ou_lines = []
             if odds_ct > 0:
                 sub = odds_df[(odds_df["match_id"] == f["match_id"]) & (odds_df["market"].str.startswith("OU"))]
                 if not sub.empty:
-                    for L in sorted(set(sub["market"].str.extract(r"OU([0-9.]+)")[0].dropna().astype(float))):
-                        ou_lines.append(float(L))
+                    try:
+                        vals = sub["market"].str.extract(r"OU([0-9.]+)")[0].dropna().astype(float).tolist()
+                        ou_lines = sorted(set(vals))
+                    except Exception:
+                        ou_lines = []
             probs = market_probs(lh, la, ou_lines=tuple(ou_lines) if ou_lines else (2.5, 3.5))
             model_rows.append({
                 "match_id": f["match_id"],
@@ -98,7 +98,7 @@ def run():
             })
     model_df = pd.DataFrame(model_rows)
 
-    # Find value bets
+    # Value bets
     picks_df = find_value_bets(
         fixtures=fixtures_df,
         odds=odds_df,
@@ -108,12 +108,12 @@ def run():
         max_picks=max_picks
     )
 
-    # Staking suggestions
+    # Staking
     sizer = StakeSizer(bankroll=bankroll, min_pct=min_stake, max_pct=max_stake)
     if not picks_df.empty:
         picks_df = sizer.apply(picks_df)
 
-    # Save JSON for /view (so we don't need Google Sheets)
+    # Save JSON for /view
     picks_records = df_to_json_records(picks_df)
     summary = {
         "fixtures": fixtures_ct,
@@ -121,13 +121,17 @@ def run():
         "model_rows": len(model_df),
         "picks": len(picks_records)
     }
-    with open(PICKS_JSON, "w") as fp:
-        json.dump(picks_records, fp)
-    with open(SUMMARY_JSON, "w") as fp:
-        json.dump(summary, fp)
+    try:
+        with open(PICKS_JSON, "w") as fp:
+            json.dump(picks_records, fp)
+        with open(SUMMARY_JSON, "w") as fp:
+            json.dump(summary, fp)
+    except Exception as e:
+        # still return OK, but include note
+        return f"OK (saved JSON failed: {e}) fixtures={fixtures_ct} odds_rows={odds_ct} model_rows={len(model_df)} picks={len(picks_records)}", 200
 
-    # Optional: also write to Google Sheets if enabled and available
-    if USE_SHEETS and SheetClient is not None:
+    # Optional Sheets write (non-fatal)
+    if USE_SHEETS and 'SheetClient' in globals() and SheetClient is not None:
         try:
             sc = SheetClient(sheet_name)
             sc.write_table("fixtures", fixtures_df)
@@ -135,28 +139,47 @@ def run():
             sc.write_table("model", model_df)
             sc.write_table("picks", picks_df)
         except Exception as e:
-            # Don't crash run; just log to response string
             summary["sheets_error"] = str(e)
 
-    return (
+    msg = (
         f"OK fixtures={fixtures_ct} odds_rows={odds_ct} "
         f"model_rows={len(model_df)} picks={len(picks_records)}"
-        + (f" sheets_error={summary.get('sheets_error')}" if summary.get("sheets_error") else ""),
-        200
     )
+    if summary.get("sheets_error"):
+        msg += f" sheets_error={summary['sheets_error']}"
+    return msg, 200
+
+@app.route("/debug_json")
+def debug_json():
+    """Quick diagnostics for picks JSON existence and content length."""
+    exists = PICKS_JSON.exists()
+    size = 0
+    rows = 0
+    j = None
+    if exists:
+        try:
+            size = PICKS_JSON.stat().st_size
+            with open(PICKS_JSON, "r") as fp:
+                j = json.load(fp)
+            rows = len(j) if isinstance(j, list) else 0
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"read_error: {e}", "exists": True, "size": size}), 200
+    return jsonify({"ok": True, "exists": exists, "size": size, "rows": rows}), 200
 
 @app.route("/view")
 def view_picks():
     """
     Render picks from local JSON (no Sheets needed).
-    Supports query filters via ?market=&league=&book=&min_edge=&min_prob=
+    Supports ?market=&league=&book=&min_edge=&min_prob=
     """
-    # Load picks JSON
+    # Load picks JSON (safe)
     rows = []
     if PICKS_JSON.exists():
         try:
             with open(PICKS_JSON, "r") as fp:
                 rows = json.load(fp)
+            if not isinstance(rows, list):
+                rows = []
         except Exception:
             rows = []
 
@@ -168,46 +191,45 @@ def view_picks():
     min_prob = float(request.args.get("min_prob", "0") or 0)
 
     def keep(r):
-        if market and r.get("market", "").lower() != market.lower():
-            return False
-        if league and r.get("league", "").lower() != league.lower():
-            return False
-        if book and r.get("book", "").lower() != book.lower():
-            return False
         try:
+            if market and r.get("market", "").lower() != market.lower():
+                return False
+            if league and r.get("league", "").lower() != league.lower():
+                return False
+            if book and r.get("book", "").lower() != book.lower():
+                return False
             if float(r.get("edge", 0) or 0) < min_edge:
                 return False
             if float(r.get("model_prob", 0) or 0) < min_prob:
                 return False
+            return True
         except Exception:
             return False
-        return True
 
-    filtered = [r for r in rows if keep(r)]
+    try:
+        filtered = [r for r in rows if keep(r)]
+        filtered.sort(key=lambda x: float(x.get("edge", 0) or 0), reverse=True)
+        summary = {}
+        if SUMMARY_JSON.exists():
+            try:
+                with open(SUMMARY_JSON, "r") as fp:
+                    summary = json.load(fp) or {}
+            except Exception:
+                summary = {}
 
-    # Sort by edge desc
-    filtered.sort(key=lambda x: float(x.get("edge", 0) or 0), reverse=True)
-
-    # Summary (if available)
-    summary = {}
-    if SUMMARY_JSON.exists():
-        try:
-            with open(SUMMARY_JSON, "r") as fp:
-                summary = json.load(fp)
-        except Exception:
-            summary = {}
-
-    return render_template(
-        "picks.html",
-        rows=filtered,
-        summary=summary,
-        # feed current filters back to the form
-        market_value=market,
-        league_value=league,
-        book_value=book,
-        min_edge_value=min_edge if min_edge else "",
-        min_prob_value=min_prob if min_prob else ""
-    )
+        return render_template(
+            "picks.html",
+            rows=filtered,
+            summary=summary,
+            market_value=market,
+            league_value=league,
+            book_value=book,
+            min_edge_value=min_edge if min_edge else "",
+            min_prob_value=min_prob if min_prob else ""
+        )
+    except Exception as e:
+        # Show a simple JSON with error instead of a 500 page
+        return jsonify({"error": "render_failed", "detail": str(e), "rows_loaded": len(rows)}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
