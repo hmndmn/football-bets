@@ -15,12 +15,7 @@ app = Flask(__name__)
 def health():
     return "OK", 200
 
-
-# ------------------------
-# Helpers
-# ------------------------
 def _add_local_time(df: pd.DataFrame, utc_col: str = "utc_kickoff", local_col: str = "kickoff_local"):
-    """Add a Vancouver local time string column based on an ISO UTC kickoff column."""
     if df.empty or utc_col not in df.columns:
         return df
     dt = pd.to_datetime(df[utc_col], utc=True, errors="coerce")
@@ -28,31 +23,32 @@ def _add_local_time(df: pd.DataFrame, utc_col: str = "utc_kickoff", local_col: s
     df[local_col] = local.dt.strftime("%Y-%m-%d %H:%M (%Z)")
     return df
 
-
 def _selection_with_team(row):
-    """
-    For 1X2: map Home/Away to actual team names; keep Draw as Draw.
-    For other markets (OU etc.), keep the original selection.
-    """
-    sel = str(row.get("selection", ""))
-    mkt = str(row.get("market", ""))
+    sel = str(row.get("selection",""))
+    mkt = str(row.get("market",""))
     if mkt == "1X2":
         if sel.lower() == "home":
             return row.get("home", sel)
         if sel.lower() == "away":
             return row.get("away", sel)
         return "Draw"
+    if mkt == "AH":
+        # Show like "Real Madrid -1.0" or "Osasuna +1.0"
+        team = row.get("selection")
+        line = row.get("line")
+        try:
+            return f"{team} {float(line):+g}"
+        except Exception:
+            return f"{team}"
     return sel
 
-
-# ------------------------
-# Core run endpoint
-# ------------------------
 @app.route("/run")
 def run():
-    # ---- Settings (env vars) ----
+    # Settings
     sheet_name   = os.getenv("SHEET_NAME", "Football Picks")
-    leagues      = [s.strip() for s in os.getenv("LEAGUES", "EPL,LaLiga").split(",")]
+    # New default leagues list includes all big ones; you can override via env
+    leagues_env  = os.getenv("LEAGUES", "EPL,LaLiga,SerieA,Bundesliga,Ligue1,UCL")
+    leagues      = [s.strip() for s in leagues_env.split(",") if s.strip()]
     hours_ahead  = int(os.getenv("HOURS_AHEAD", "240"))
     book_pref    = os.getenv("BOOK_FILTER", "bet365")
     edge_thresh  = float(os.getenv("EDGE_THRESHOLD", "0.05"))
@@ -66,115 +62,104 @@ def run():
 
     sc = SheetClient(sheet_name)
 
-    # ---- 1) Fixtures + Odds ----
+    # 1) Fixtures & Odds
     fixtures = fetch_fixtures(leagues, hours_ahead=hours_ahead)
     odds     = fetch_odds(fixtures, book_preference=book_pref)
 
-    # ---- 2) Model probabilities per match ----
+    # 2) Model probs per match (collect OU lines and AH lines seen in odds)
     model_rows = []
     for _, m in fixtures.iterrows():
         lh, la = predict_match(m["home"], m["away"], m["league"])
 
-        # Collect OU lines from odds for this match (e.g., 2.5, 3.0)
+        # OU lines present
         ou_lines = []
-        if not odds.empty:
-            lines = odds.loc[odds["match_id"] == m["match_id"], "market"].unique()
-            for line in lines:
-                s = str(line)
-                if s.startswith("OU"):
-                    try:
-                        ou_lines.append(float(s[2:]))
-                    except Exception:
-                        pass
-        ou_lines = sorted(set(ou_lines)) if ou_lines else [2.5]
+        # AH lines we normalize to *home-relative* numbers:
+        # - If an odds row has side=='home' with +0.5 => home_line = +0.5
+        # - If side=='away' with +0.5 => home_line = -0.5
+        ah_home_lines = []
 
-        probs = market_probs(lh, la, ou_lines=tuple(ou_lines))
+        if not odds.empty:
+            mo = odds[odds["match_id"] == m["match_id"]]
+            for L in mo.loc[mo["market"].astype(str).str.startswith("OU", na=False), "market"].unique():
+                try:
+                    ou_lines.append(float(str(L)[2:]))
+                except Exception:
+                    pass
+
+            for _, r in mo[mo["market"] == "AH"].iterrows():
+                side = str(r.get("side","")).lower()
+                try:
+                    line = float(r.get("line"))
+                except Exception:
+                    continue
+                if side == "home":
+                    ah_home_lines.append(line)
+                elif side == "away":
+                    ah_home_lines.append(-line)
+
+        ou_lines = sorted(set(ou_lines)) if ou_lines else [2.5]
+        ah_home_lines = sorted(set(ah_home_lines))
+
+        probs = market_probs(lh, la, ou_lines=tuple(ou_lines), ah_home_lines=tuple(ah_home_lines))
         model_rows.append({"match_id": m["match_id"], **probs})
 
     model_probs = pd.DataFrame(model_rows)
 
-    # ---- 3) Value bets vs odds ----
+    # 3) Value bets
     picks = find_value_bets(model_probs, odds, edge_threshold=edge_thresh)
 
-    # ---- 4) Staking (Half-Kelly with caps) ----
+    # 4) Staking
     sizer = StakeSizer(bankroll, min_pct=min_stake, max_pct=max_stake)
     picks = sizer.apply(picks)
 
-    # ---- 4b) Add readable match info; local time; sort; cap; enrich selection ----
+    # 4b) Merge meta, local time, nice selection name, sort/cap
     if not picks.empty:
-        # Merge kickoff/home/away + league
-        meta = fixtures[["match_id", "league", "utc_kickoff", "home", "away"]].copy()
+        meta = fixtures[["match_id","league","utc_kickoff","home","away"]].copy()
         picks = picks.merge(meta, on="match_id", how="left")
-
-        # Local time column (America/Vancouver)
-        picks = _add_local_time(picks, utc_col="utc_kickoff", local_col="kickoff_local")
-
-        # Human-friendly match name
-        picks["match"] = picks.apply(
-            lambda r: f"{r.get('home','?')} vs {r.get('away','?')}", axis=1
-        )
-
-        # Replace Home/Away with team name for 1X2
+        picks = _add_local_time(picks, "utc_kickoff", "kickoff_local")
+        picks["match"] = picks.apply(lambda r: f"{r.get('home','?')} vs {r.get('away','?')}", axis=1)
         picks["selection_name"] = picks.apply(_selection_with_team, axis=1)
-
-        # Optional compact label like "Osasuna @ 14.00"
-        def _pick_label(r):
-            sel = r.get("selection_name") or r.get("selection")
-            try:
-                price = float(r.get("price", 0))
-                return f"{sel} @ {price:.2f}"
-            except Exception:
-                return str(sel)
-        picks["pick_label"] = picks.apply(_pick_label, axis=1)
-
-        # Round stake_amt to whole dollars
         picks["stake_amt"] = picks["stake_amt"].fillna(0).round(0).astype(int)
-
-        # Sort by local kickoff (soonest first) then by edge desc
-        sort_cols = ["kickoff_local", "edge"] if "kickoff_local" in picks.columns else ["utc_kickoff", "edge"]
+        sort_cols = ["kickoff_local","edge"] if "kickoff_local" in picks.columns else ["utc_kickoff","edge"]
         picks = picks.sort_values(by=sort_cols, ascending=[True, False]).reset_index(drop=True)
-
-        # Cap number of picks if MAX_PICKS > 0
         if max_picks and len(picks) > max_picks:
             picks = picks.head(max_picks).reset_index(drop=True)
 
-        # Reorder columns for readability (keep only those that exist)
         col_order = [
             "kickoff_local","utc_kickoff","league","match","market",
-            "selection_name","selection","price","book",
+            "selection_name","selection","line","price","book",
             "model_prob","implied","edge","stake_pct","stake_amt",
-            "home","away","match_id","pick_label"
+            "home","away","match_id","side"
         ]
         picks = picks[[c for c in col_order if c in picks.columns]]
 
-    # ---- 4c) Summary ----
     summary = pd.DataFrame([{
         "num_picks": int(len(picks)),
         "total_stake": float(picks["stake_amt"].sum() if not picks.empty else 0.0),
         "avg_edge": float(picks["edge"].mean() if not picks.empty else 0.0),
         "bankroll": bankroll,
         "edge_threshold": edge_thresh,
-        "max_picks": max_picks
+        "max_picks": max_picks,
+        "leagues": ",".join(leagues),
     }])
 
-    # ---- 5) Write to Google Sheets ----
+    # 5) Write to Sheets
     try:
-        fixtures = _add_local_time(fixtures, utc_col="utc_kickoff", local_col="kickoff_local")
-
+        fixtures = _add_local_time(fixtures, "utc_kickoff", "kickoff_local")
         if fixtures.empty:
             fixtures = pd.DataFrame(columns=["match_id","league","utc_kickoff","kickoff_local","home","away"])
         if odds.empty:
-            odds = pd.DataFrame(columns=["match_id","market","selection","price","book"])
+            odds = pd.DataFrame(columns=["match_id","market","selection","price","book","side","line"])
         if model_probs.empty:
             model_probs = pd.DataFrame(columns=["match_id"])
         if picks.empty:
             picks = pd.DataFrame(columns=[
                 "kickoff_local","utc_kickoff","league","match","market",
-                "selection_name","selection","price","book",
+                "selection_name","selection","line","price","book",
                 "model_prob","implied","edge","stake_pct","stake_amt",
-                "home","away","match_id","pick_label"
+                "home","away","match_id","side"
             ])
-
+        sc = SheetClient(sheet_name)
         sc.write_table("fixtures", fixtures)
         sc.write_table("odds", odds)
         sc.write_table("model_probs", model_probs)
@@ -184,20 +169,13 @@ def run():
         return f"Error updating sheet: {e}", 500
 
     return (
-        f"OK fixtures={len(fixtures)} "
-        f"odds_rows={len(odds)} "
-        f"model_rows={len(model_probs)} "
-        f"picks={len(picks)}",
+        f"OK fixtures={len(fixtures)} odds_rows={len(odds)} "
+        f"model_rows={len(model_probs)} picks={len(picks)}",
         200
     )
 
-
-# ------------------------
-# Read/Filter view endpoint
-# ------------------------
 @app.route("/view")
 def view_picks():
-    """Read 'picks' from Google Sheets and render a clean HTML table with filters."""
     sheet_name = os.getenv("SHEET_NAME", "Football Picks")
     sc = SheetClient(sheet_name)
     try:
@@ -205,16 +183,14 @@ def view_picks():
     except Exception as e:
         return f"Error reading sheet: {e}", 500
 
-    # Numeric casting for display/filtering
-    for c in ["price","model_prob","implied","edge","stake_amt"]:
+    for c in ["price","model_prob","implied","edge","stake_amt","line"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # --------- Filters (via query string) ----------
-    # Example: /view?min_edge=0.08&market=OU&league=EPL&book=bet365
-    q_market   = (request.args.get("market") or "").strip()       # "1X2" or "OU" (prefix)
-    q_league   = (request.args.get("league") or "").strip()       # "EPL", "LaLiga"
-    q_book     = (request.args.get("book") or "").strip()         # bookmaker name
+    # Filters
+    q_market   = (request.args.get("market") or "").strip()    # "1X2", "OU", "AH"
+    q_league   = (request.args.get("league") or "").strip()
+    q_book     = (request.args.get("book") or "").strip()
     q_min_edge = request.args.get("min_edge")
     q_min_prob = request.args.get("min_prob")
 
@@ -232,32 +208,26 @@ def view_picks():
 
     if q_min_edge:
         try:
-            v = float(q_min_edge)
-            df = df[(df["edge"].fillna(0) >= v)]
+            v = float(q_min_edge); df = df[(df["edge"].fillna(0) >= v)]
         except Exception:
             pass
 
     if q_min_prob:
         try:
-            v = float(q_min_prob)
-            df = df[(df["model_prob"].fillna(0) >= v)]
+            v = float(q_min_prob); df = df[(df["model_prob"].fillna(0) >= v)]
         except Exception:
             pass
 
-    # Sort for display
     if not df.empty:
         sort_cols = ["kickoff_local","edge"] if "kickoff_local" in df.columns else ["utc_kickoff","edge"]
         df = df.sort_values(by=sort_cols, ascending=[True, False])
 
-    # Columns to show in the template
     cols = [c for c in [
         "kickoff_local","league","match","market",
-        "selection_name","price","book","model_prob","implied","edge","stake_amt",
-        "utc_kickoff"  # kept as fallback, not displayed if local exists
+        "selection_name","price","book","model_prob","implied","edge","stake_amt"
     ] if c in df.columns]
     df = df[cols] if cols else df
 
-    # Render with 'rows' and 'qs' for the template
     return render_template(
         "picks.html",
         rows=df.to_dict(orient="records"),
@@ -269,7 +239,6 @@ def view_picks():
             "min_prob": q_min_prob or ""
         }
     )
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

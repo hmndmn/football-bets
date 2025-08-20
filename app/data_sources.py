@@ -1,196 +1,191 @@
 import os
 import requests
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 
-# Using The Odds API for both fixtures and odds (free-plan friendly)
-LEAGUE_MAP = {
-    "EPL":    {"odds_key": "soccer_epl"},
-    "LaLiga": {"odds_key": "soccer_spain_la_liga"},
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+
+# Map friendly names -> The Odds API sport keys
+SPORT_KEYS = {
+    "EPL":    "soccer_epl",
+    "LaLiga": "soccer_spain_la_liga",
+    "SerieA": "soccer_italy_serie_a",
+    "Bundesliga": "soccer_germany_bundesliga",
+    "Ligue1": "soccer_france_ligue_one",
+    "UCL":    "soccer_uefa_champs_league",
 }
 
-ODDS_BASE = "https://api.the-odds-api.com/v4"
+REGIONS = os.getenv("ODDS_REGIONS", "uk,eu,us")  # broaden coverage
+ODDS_FORMAT = "decimal"  # we want decimal odds
 
-def _odds_key():
-    key = os.environ.get("ODDS_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("ODDS_API_KEY is missing")
-    return key
+def _hours_from_now_iso(hours: int) -> str:
+    dt = datetime.now(timezone.utc) + timedelta(hours=hours)
+    return dt.isoformat().replace("+00:00", "Z")
 
-def _norm(s):
-    return s.strip().lower() if isinstance(s, str) else s
-
-def _fmt_line(x):
-    """Normalize lines so '2.0' -> '2', keep '2.5' as '2.5'."""
-    try:
-        v = float(x)
-        if abs(v - int(v)) < 1e-9:
-            return str(int(v))
-        s = str(v)
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-        return s
-    except Exception:
-        return str(x)
-
-def fetch_fixtures(leagues, hours_ahead=240):
+def _fetch_odds_for_sport(sport_key: str, hours_ahead: int) -> list:
     """
-    Use The Odds API to get upcoming events for each league.
-    Returns: match_id (from Odds API event id when present), league, utc_kickoff, home, away
+    Pull odds for a single sport_key. Returns the raw JSON list of events.
+    We use odds endpoint (markets=h2h,totals,spreads) so we get everything we need.
+    """
+    if not ODDS_API_KEY:
+        return []
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": REGIONS,
+        "oddsFormat": ODDS_FORMAT,
+        "markets": "h2h,totals,spreads",
+        "dateFormat": "iso",
+    }
+    # The Odds API returns only upcoming by default; hoursAhead filter is implicit via the feed.
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        return []
+    try:
+        return r.json()
+    except Exception:
+        return []
+
+def fetch_fixtures(leagues: list[str], hours_ahead: int = 240) -> pd.DataFrame:
+    """
+    Build a fixtures table for all requested leagues from The Odds API odds feed.
+    Columns: match_id, league, utc_kickoff, home, away
     """
     rows = []
-    key = _odds_key()
-
     for lg in leagues:
-        odds_key = LEAGUE_MAP.get(lg, {}).get("odds_key")
-        if not odds_key:
+        sport_key = SPORT_KEYS.get(lg, None)
+        if not sport_key:
             continue
-
-        r = requests.get(
-            f"{ODDS_BASE}/sports/{odds_key}/odds",
-            params={
-                "apiKey": key,
-                "regions": os.getenv("ODDS_REGION", "eu"),
-                "oddsFormat": "decimal",
-                "markets": "h2h,totals",   # BTTS not supported by this endpoint
-            },
-            timeout=25
-        )
-        if r.status_code != 200:
-            continue
-
-        events = r.json() or []
+        events = _fetch_odds_for_sport(sport_key, hours_ahead)
         for ev in events:
-            event_id = ev.get("id") or ""
-            commence = ev.get("commence_time")  # ISO8601
-            home = ev.get("home_team")
-            away = ev.get("away_team")
-            if not (home and away and commence):
-                continue
-
-            match_id = str(event_id) if event_id else f"{_norm(home)}_{_norm(away)}_{commence}"
             rows.append({
-                "match_id": match_id,
+                "match_id": ev.get("id"),
                 "league": lg,
-                "utc_kickoff": commence,
-                "home": home,
-                "away": away,
+                "utc_kickoff": ev.get("commence_time"),
+                "home": ev.get("home_team"),
+                "away": ev.get("away_team"),
             })
-
+    if not rows:
+        return pd.DataFrame(columns=["match_id","league","utc_kickoff","home","away"])
     df = pd.DataFrame(rows).drop_duplicates(subset=["match_id"]).reset_index(drop=True)
     return df
 
-def fetch_odds(fixtures_df, book_preference="bet365"):
+def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365") -> pd.DataFrame:
     """
-    Collect odds for our fixtures (1X2 and Totals).
-    - Normalizes h2h selections to 'Home'/'Away'/'Draw' using event team names.
-    Returns: match_id, market, selection, price, book
+    Build normalized odds rows for H2H, Totals, and Asian Handicap (Spreads).
+    Columns (common): match_id, market, selection, price, book
+    For AH we also include: side ('home'/'away') and line (float)
+    - H2H -> market='1X2', selection in {'Home','Draw','Away'}
+    - Totals -> market='OU{line}', selection in {'Over','Under'}
+    - Spreads -> market='AH' (we also set columns 'side' and 'line')
     """
-    key = _odds_key()
-    if fixtures_df.empty:
-        return pd.DataFrame(columns=["match_id","market","selection","price","book"])
+    if fixtures.empty:
+        return pd.DataFrame(columns=["match_id","market","selection","price","book","side","line"])
 
+    # Group fixtures by league so we don’t over-fetch
+    needed_keys = {row["league"] for _, row in fixtures.iterrows()}
     rows = []
-
-    for lg, group in fixtures_df.groupby("league"):
-        odds_key = LEAGUE_MAP.get(lg, {}).get("odds_key")
-        if not odds_key:
+    for lg in needed_keys:
+        sport_key = SPORT_KEYS.get(lg)
+        if not sport_key:
             continue
-
-        rr = requests.get(
-            f"{ODDS_BASE}/sports/{odds_key}/odds",
-            params={
-                "apiKey": key,
-                "regions": os.getenv("ODDS_REGION", "eu"),
-                "oddsFormat": "decimal",
-                "markets": "h2h,totals",   # keep to supported markets
-            },
-            timeout=25
-        )
-        if rr.status_code != 200:
-            continue
-        events = rr.json() or []
-
-        def make_key(ev):
-            eid = ev.get("id") or ""
-            if eid:
-                return str(eid)
-            return f"{_norm(ev.get('home_team'))}_{_norm(ev.get('away_team'))}_{ev.get('commence_time')}"
-
-        target_ids = set(group["match_id"].tolist())
+        events = _fetch_odds_for_sport(sport_key, hours_ahead=240)
         for ev in events:
-            mid = make_key(ev)
-            if mid not in target_ids:
+            match_id = ev.get("id")
+            if match_id not in set(fixtures["match_id"]):
                 continue
 
-            home_name = ev.get("home_team")
-            away_name = ev.get("away_team")
-            home_norm = _norm(home_name)
-            away_norm = _norm(away_name)
+            # Choose bookmaker: prefer the 'book_preference' if available, else take best price across books
+            bookmakers = ev.get("bookmakers", []) or []
+            # If a preferred book exists, keep only that one first; else all
+            preferred = [b for b in bookmakers if b.get("title","").lower() == book_preference.lower()]
+            bks = preferred if preferred else bookmakers
 
-            for bk in (ev.get("bookmakers") or []):
-                for mk in (bk.get("markets") or []):
-                    keym = mk.get("key")
-                    outs = mk.get("outcomes") or []
+            for bk in bks:
+                book = bk.get("title") or ""
+                for mkt in bk.get("markets", []):
+                    key = (mkt.get("key") or "").lower()
 
-                    if keym == "h2h":
-                        for o in outs:
-                            name, price = o.get("name"), o.get("price")
-                            if not (name and price):
+                    # H2H -> 1X2
+                    if key == "h2h":
+                        # outcomes: name (team or 'Draw'), price
+                        for oc in mkt.get("outcomes", []):
+                            nm = oc.get("name")
+                            price = oc.get("price")
+                            if nm is None or price is None:
                                 continue
-                            sel_norm = _norm(name)
-                            # Normalize to Home/Away/Draw
-                            if sel_norm == _norm("draw"):
-                                selection = "Draw"
-                            elif sel_norm == home_norm:
-                                selection = "Home"
-                            elif sel_norm == away_norm:
-                                selection = "Away"
+                            sel = None
+                            if nm == ev.get("home_team"):
+                                sel = "Home"
+                            elif nm == ev.get("away_team"):
+                                sel = "Away"
+                            elif nm.lower() == "draw":
+                                sel = "Draw"
                             else:
-                                selection = name
+                                # fallback: treat as exact name
+                                sel = nm
                             rows.append({
-                                "match_id": mid,
+                                "match_id": match_id,
                                 "market": "1X2",
-                                "selection": selection,
+                                "selection": sel,
                                 "price": float(price),
-                                "book": bk.get("title","")
+                                "book": book,
+                                "side": "",
+                                "line": None,
                             })
 
-                    elif keym == "totals":
-                        base_line = outs[0].get("point") if outs else None
-                        for o in outs:
-                            name = o.get("name")    # "Over" / "Under"
-                            price = o.get("price")
-                            point = o.get("point", base_line)
-                            if name and price and point is not None:
-                                line_str = _fmt_line(point)
-                                rows.append({
-                                    "match_id": mid,
-                                    "market": f"OU{line_str}",
-                                    "selection": name,
-                                    "price": float(price),
-                                    "book": bk.get("title","")
-                                })
+                    # Totals -> OU{line}
+                    elif key == "totals":
+                        total = mkt.get("outcomes", [])
+                        # Expect two outcomes: Over/Under with 'point'
+                        for oc in total:
+                            line = oc.get("point")
+                            price = oc.get("price")
+                            name = (oc.get("name") or "").capitalize()
+                            if line is None or price is None or name not in ("Over","Under"):
+                                continue
+                            rows.append({
+                                "match_id": match_id,
+                                "market": f"OU{float(line):g}",
+                                "selection": name,  # Over or Under
+                                "price": float(price),
+                                "book": book,
+                                "side": "",
+                                "line": float(line),
+                            })
 
-                    # NOTE: 'btts' is not a valid market on this endpoint.
-                    # If The Odds API adds it later, this block would parse it:
-                    # elif keym == "btts":
-                    #     for o in outs:
-                    #         name = o.get("name")    # "Yes" / "No"
-                    #         price = o.get("price")
-                    #         if name and price:
-                    #             rows.append({...})
+                    # Spreads -> Asian Handicap (AH)
+                    elif key == "spreads":
+                        # outcomes: name (team), point (handicap relative to that team), price
+                        for oc in mkt.get("outcomes", []):
+                            team = oc.get("name")
+                            line = oc.get("point")
+                            price = oc.get("price")
+                            if team is None or line is None or price is None:
+                                continue
+                            # Determine side (home/away) for the selected team
+                            if team == ev.get("home_team"):
+                                side = "home"
+                            elif team == ev.get("away_team"):
+                                side = "away"
+                            else:
+                                continue
+                            rows.append({
+                                "match_id": match_id,
+                                "market": "AH",          # we’ll keep AH generic; side+line carry specifics
+                                "selection": team,       # actual team name
+                                "price": float(price),
+                                "book": book,
+                                "side": side,            # 'home' or 'away'
+                                "line": float(line),     # e.g., -1.0 for fav, +1.0 for dog (relative to that team)
+                            })
 
+    if not rows:
+        return pd.DataFrame(columns=["match_id","market","selection","price","book","side","line"])
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
 
-    # Prefer a specific book (e.g., Bet365) if available per (match, market, selection)
-    if book_preference:
-        df["_pref"] = (df["book"].str.lower() == str(book_preference).lower()).astype(int)
-        df = (
-            df.sort_values(["match_id","market","selection","_pref"], ascending=[True,True,True,False])
-              .drop_duplicates(subset=["match_id","market","selection"], keep="first")
-              .drop(columns=["_pref"])
-        )
-
-    return df.reset_index(drop=True)
+    # If multiple prices per match/market/selection/book, keep the best (highest) price
+    df = (df.sort_values("price", ascending=False)
+            .drop_duplicates(subset=["match_id","market","selection","book","side","line"])
+            .reset_index(drop=True))
+    return df
