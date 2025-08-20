@@ -1,10 +1,11 @@
 import os
+import requests
 import pandas as pd
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify
 
 from app.sheets import SheetClient
-from app.data_sources import fetch_fixtures, fetch_odds
+from app.data_sources import fetch_fixtures, fetch_odds, SPORT_KEYS
 from app.model import predict_match, market_probs
 from app.markets import find_value_bets
 from app.staking import StakeSizer
@@ -15,6 +16,9 @@ app = Flask(__name__)
 def health():
     return "OK", 200
 
+# ------------------------
+# Helpers
+# ------------------------
 def _add_local_time(df: pd.DataFrame, utc_col: str = "utc_kickoff", local_col: str = "kickoff_local"):
     if df.empty or utc_col not in df.columns:
         return df
@@ -33,7 +37,6 @@ def _selection_with_team(row):
             return row.get("away", sel)
         return "Draw"
     if mkt == "AH":
-        # Show like "Real Madrid -1.0" or "Osasuna +1.0"
         team = row.get("selection")
         line = row.get("line")
         try:
@@ -42,11 +45,12 @@ def _selection_with_team(row):
             return f"{team}"
     return sel
 
+# ------------------------
+# Core run endpoint
+# ------------------------
 @app.route("/run")
 def run():
-    # Settings
     sheet_name   = os.getenv("SHEET_NAME", "Football Picks")
-    # New default leagues list includes all big ones; you can override via env
     leagues_env  = os.getenv("LEAGUES", "EPL,LaLiga,SerieA,Bundesliga,Ligue1,UCL")
     leagues      = [s.strip() for s in leagues_env.split(",") if s.strip()]
     hours_ahead  = int(os.getenv("HOURS_AHEAD", "240"))
@@ -64,28 +68,26 @@ def run():
 
     # 1) Fixtures & Odds
     fixtures = fetch_fixtures(leagues, hours_ahead=hours_ahead)
-    odds     = fetch_odds(fixtures, book_preference=book_pref)
+    odds     = fetch_odds(fixtures, book_preference=book_pref, hours_ahead=hours_ahead)
 
-    # 2) Model probs per match (collect OU lines and AH lines seen in odds)
+    # 2) Model probs per match (collect OU/AH lines present in odds)
     model_rows = []
     for _, m in fixtures.iterrows():
         lh, la = predict_match(m["home"], m["away"], m["league"])
 
-        # OU lines present
         ou_lines = []
-        # AH lines we normalize to *home-relative* numbers:
-        # - If an odds row has side=='home' with +0.5 => home_line = +0.5
-        # - If side=='away' with +0.5 => home_line = -0.5
         ah_home_lines = []
-
         if not odds.empty:
             mo = odds[odds["match_id"] == m["match_id"]]
+
+            # OU lines like OU2.5 -> 2.5
             for L in mo.loc[mo["market"].astype(str).str.startswith("OU", na=False), "market"].unique():
                 try:
                     ou_lines.append(float(str(L)[2:]))
                 except Exception:
                     pass
 
+            # AH: convert odds rows to home-relative lines
             for _, r in mo[mo["market"] == "AH"].iterrows():
                 side = str(r.get("side","")).lower()
                 try:
@@ -112,7 +114,7 @@ def run():
     sizer = StakeSizer(bankroll, min_pct=min_stake, max_pct=max_stake)
     picks = sizer.apply(picks)
 
-    # 4b) Merge meta, local time, nice selection name, sort/cap
+    # 4b) Merge meta, local time, nice selection, sort/cap
     if not picks.empty:
         meta = fixtures[["match_id","league","utc_kickoff","home","away"]].copy()
         picks = picks.merge(meta, on="match_id", how="left")
@@ -174,6 +176,9 @@ def run():
         200
     )
 
+# ------------------------
+# Read/Filter view endpoint
+# ------------------------
 @app.route("/view")
 def view_picks():
     sheet_name = os.getenv("SHEET_NAME", "Football Picks")
@@ -187,7 +192,6 @@ def view_picks():
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Filters
     q_market   = (request.args.get("market") or "").strip()    # "1X2", "OU", "AH"
     q_league   = (request.args.get("league") or "").strip()
     q_book     = (request.args.get("book") or "").strip()
@@ -239,6 +243,48 @@ def view_picks():
             "min_prob": q_min_prob or ""
         }
     )
+
+# ------------------------
+# Odds API probe (debug)
+# ------------------------
+@app.route("/probe_odds")
+def probe_odds():
+    """Call The Odds API directly for a couple leagues and show counts + headers."""
+    api_key = os.getenv("ODDS_API_KEY", "").strip()
+    regions = os.getenv("ODDS_REGIONS", "uk,eu,us")
+    if not api_key:
+        return jsonify({"ok": False, "error": "ODDS_API_KEY missing"}), 500
+
+    sample_leagues = ["EPL", "LaLiga"]
+    out = {"ok": True, "regions": regions, "leagues": {}}
+
+    for lg in sample_leagues:
+        key = SPORT_KEYS.get(lg)
+        if not key:
+            out["leagues"][lg] = {"error": "sport key missing"}
+            continue
+        url = f"https://api.the-odds-api.com/v4/sports/{key}/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": regions,
+            "oddsFormat": "decimal",
+            "markets": "h2h,totals,spreads",
+            "dateFormat": "iso",
+        }
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            try_json = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+            out["leagues"][lg] = {
+                "status": r.status_code,
+                "x-requests-remaining": r.headers.get("x-requests-remaining"),
+                "x-requests-used": r.headers.get("x-requests-used"),
+                "events": len(try_json) if isinstance(try_json, list) else None,
+                "sample": (try_json[0] if isinstance(try_json, list) and try_json else try_json) or {},
+            }
+        except Exception as e:
+            out["leagues"][lg] = {"error": str(e)}
+
+    return jsonify(out), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
