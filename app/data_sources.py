@@ -1,31 +1,26 @@
 import os
 import requests
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 
-# Map friendly names -> The Odds API sport keys
+# Map friendly names -> The Odds API sport keys (corrected)
 SPORT_KEYS = {
-    "EPL":    "soccer_epl",
-    "LaLiga": "soccer_spain_la_liga",
-    "SerieA": "soccer_italy_serie_a",
+    "EPL":        "soccer_epl",
+    "LaLiga":     "soccer_spain_la_liga",
+    "SerieA":     "soccer_italy_serie_a",
     "Bundesliga": "soccer_germany_bundesliga",
-    "Ligue1": "soccer_france_ligue_one",
-    "UCL":    "soccer_uefa_champs_league",
+    "Ligue1":     "soccer_france_ligue_1",            # <- fixed (was ligue_one)
+    "UCL":        "soccer_uefa_champions_league",     # <- fixed (was champs_league)
 }
 
 REGIONS = os.getenv("ODDS_REGIONS", "uk,eu,us")  # broaden coverage
-ODDS_FORMAT = "decimal"  # we want decimal odds
+ODDS_FORMAT = "decimal"  # decimal odds
 
-def _hours_from_now_iso(hours: int) -> str:
-    dt = datetime.now(timezone.utc) + timedelta(hours=hours)
-    return dt.isoformat().replace("+00:00", "Z")
-
-def _fetch_odds_for_sport(sport_key: str, hours_ahead: int) -> list:
+def _fetch_odds_for_sport(sport_key: str) -> list:
     """
-    Pull odds for a single sport_key. Returns the raw JSON list of events.
-    We use odds endpoint (markets=h2h,totals,spreads) so we get everything we need.
+    Pull upcoming odds for a single sport_key.
+    We request h2h, totals, spreads in one call.
     """
     if not ODDS_API_KEY:
         return []
@@ -37,8 +32,10 @@ def _fetch_odds_for_sport(sport_key: str, hours_ahead: int) -> list:
         "markets": "h2h,totals,spreads",
         "dateFormat": "iso",
     }
-    # The Odds API returns only upcoming by default; hoursAhead filter is implicit via the feed.
-    r = requests.get(url, params=params, timeout=20)
+    try:
+        r = requests.get(url, params=params, timeout=25)
+    except Exception:
+        return []
     if r.status_code != 200:
         return []
     try:
@@ -48,16 +45,16 @@ def _fetch_odds_for_sport(sport_key: str, hours_ahead: int) -> list:
 
 def fetch_fixtures(leagues: list[str], hours_ahead: int = 240) -> pd.DataFrame:
     """
-    Build a fixtures table for all requested leagues from The Odds API odds feed.
+    Build fixtures from the odds feed for the requested leagues.
     Columns: match_id, league, utc_kickoff, home, away
     """
     rows = []
     for lg in leagues:
-        sport_key = SPORT_KEYS.get(lg, None)
+        sport_key = SPORT_KEYS.get(lg)
         if not sport_key:
             continue
-        events = _fetch_odds_for_sport(sport_key, hours_ahead)
-        for ev in events:
+        events = _fetch_odds_for_sport(sport_key)
+        for ev in events or []:
             rows.append({
                 "match_id": ev.get("id"),
                 "league": lg,
@@ -67,63 +64,58 @@ def fetch_fixtures(leagues: list[str], hours_ahead: int = 240) -> pd.DataFrame:
             })
     if not rows:
         return pd.DataFrame(columns=["match_id","league","utc_kickoff","home","away"])
-    df = pd.DataFrame(rows).drop_duplicates(subset=["match_id"]).reset_index(drop=True)
+    df = pd.DataFrame(rows).dropna(subset=["match_id"]).drop_duplicates(subset=["match_id"]).reset_index(drop=True)
     return df
 
 def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365") -> pd.DataFrame:
     """
-    Build normalized odds rows for H2H, Totals, and Asian Handicap (Spreads).
-    Columns (common): match_id, market, selection, price, book
-    For AH we also include: side ('home'/'away') and line (float)
-    - H2H -> market='1X2', selection in {'Home','Draw','Away'}
-    - Totals -> market='OU{line}', selection in {'Over','Under'}
-    - Spreads -> market='AH' (we also set columns 'side' and 'line')
+    Normalize odds rows for H2H, Totals, and Asian Handicap (Spreads).
+    Output columns: match_id, market, selection, price, book, side, line
+      - H2H -> market='1X2', selection in {'Home','Draw','Away'}
+      - Totals -> market='OU{line}', selection in {'Over','Under'}
+      - Spreads -> market='AH', selection = team name, plus side ('home'/'away') and line (float)
+    We keep the SINGLE BEST price across ALL books per (match, market, selection[, side, line]).
     """
     if fixtures.empty:
         return pd.DataFrame(columns=["match_id","market","selection","price","book","side","line"])
 
-    # Group fixtures by league so we don’t over-fetch
-    needed_keys = {row["league"] for _, row in fixtures.iterrows()}
+    wanted_ids = set(fixtures["match_id"])
+    wanted_leagues = set(fixtures["league"])
+
     rows = []
-    for lg in needed_keys:
+    # Fetch each league once; filter by match ids we actually have
+    for lg in wanted_leagues:
         sport_key = SPORT_KEYS.get(lg)
         if not sport_key:
             continue
-        events = _fetch_odds_for_sport(sport_key, hours_ahead=240)
-        for ev in events:
+        events = _fetch_odds_for_sport(sport_key)
+        for ev in events or []:
             match_id = ev.get("id")
-            if match_id not in set(fixtures["match_id"]):
+            if match_id not in wanted_ids:
                 continue
 
-            # Choose bookmaker: prefer the 'book_preference' if available, else take best price across books
             bookmakers = ev.get("bookmakers", []) or []
-            # If a preferred book exists, keep only that one first; else all
-            preferred = [b for b in bookmakers if b.get("title","").lower() == book_preference.lower()]
-            bks = preferred if preferred else bookmakers
 
-            for bk in bks:
+            for bk in bookmakers:
                 book = bk.get("title") or ""
-                for mkt in bk.get("markets", []):
+                for mkt in bk.get("markets", []) or []:
                     key = (mkt.get("key") or "").lower()
 
                     # H2H -> 1X2
                     if key == "h2h":
-                        # outcomes: name (team or 'Draw'), price
-                        for oc in mkt.get("outcomes", []):
+                        for oc in mkt.get("outcomes", []) or []:
                             nm = oc.get("name")
                             price = oc.get("price")
                             if nm is None or price is None:
                                 continue
-                            sel = None
                             if nm == ev.get("home_team"):
                                 sel = "Home"
                             elif nm == ev.get("away_team"):
                                 sel = "Away"
-                            elif nm.lower() == "draw":
+                            elif str(nm).lower() == "draw":
                                 sel = "Draw"
                             else:
-                                # fallback: treat as exact name
-                                sel = nm
+                                sel = str(nm)
                             rows.append({
                                 "match_id": match_id,
                                 "market": "1X2",
@@ -136,56 +128,68 @@ def fetch_odds(fixtures: pd.DataFrame, book_preference: str = "bet365") -> pd.Da
 
                     # Totals -> OU{line}
                     elif key == "totals":
-                        total = mkt.get("outcomes", [])
-                        # Expect two outcomes: Over/Under with 'point'
-                        for oc in total:
+                        for oc in mkt.get("outcomes", []) or []:
+                            name = (oc.get("name") or "").capitalize()  # Over / Under
                             line = oc.get("point")
                             price = oc.get("price")
-                            name = (oc.get("name") or "").capitalize()
-                            if line is None or price is None or name not in ("Over","Under"):
+                            if name not in ("Over","Under") or line is None or price is None:
+                                continue
+                            try:
+                                L = float(line)
+                            except Exception:
                                 continue
                             rows.append({
                                 "match_id": match_id,
-                                "market": f"OU{float(line):g}",
-                                "selection": name,  # Over or Under
+                                "market": f"OU{L:g}",
+                                "selection": name,
                                 "price": float(price),
                                 "book": book,
                                 "side": "",
-                                "line": float(line),
+                                "line": L,
                             })
 
-                    # Spreads -> Asian Handicap (AH)
+                    # Spreads -> Asian Handicap
                     elif key == "spreads":
-                        # outcomes: name (team), point (handicap relative to that team), price
-                        for oc in mkt.get("outcomes", []):
+                        for oc in mkt.get("outcomes", []) or []:
                             team = oc.get("name")
                             line = oc.get("point")
                             price = oc.get("price")
                             if team is None or line is None or price is None:
                                 continue
-                            # Determine side (home/away) for the selected team
                             if team == ev.get("home_team"):
                                 side = "home"
                             elif team == ev.get("away_team"):
                                 side = "away"
                             else:
                                 continue
+                            try:
+                                L = float(line)
+                            except Exception:
+                                continue
                             rows.append({
                                 "match_id": match_id,
-                                "market": "AH",          # we’ll keep AH generic; side+line carry specifics
-                                "selection": team,       # actual team name
+                                "market": "AH",
+                                "selection": str(team),
                                 "price": float(price),
                                 "book": book,
-                                "side": side,            # 'home' or 'away'
-                                "line": float(line),     # e.g., -1.0 for fav, +1.0 for dog (relative to that team)
+                                "side": side,
+                                "line": L,
                             })
 
     if not rows:
         return pd.DataFrame(columns=["match_id","market","selection","price","book","side","line"])
     df = pd.DataFrame(rows)
 
-    # If multiple prices per match/market/selection/book, keep the best (highest) price
-    df = (df.sort_values("price", ascending=False)
-            .drop_duplicates(subset=["match_id","market","selection","book","side","line"])
-            .reset_index(drop=True))
+    # Keep the single BEST price across ALL books per unique outcome signature
+    # (match_id, market, selection[, side, line])
+    group_cols = ["match_id","market","selection"]
+    if "side" in df.columns:
+        group_cols.append("side")
+    if "line" in df.columns:
+        group_cols.append("line")
+
+    # Sort so the first in each group is the best price; keep its book too
+    df = df.sort_values("price", ascending=False)
+    df = df.drop_duplicates(subset=group_cols, keep="first").reset_index(drop=True)
+
     return df
