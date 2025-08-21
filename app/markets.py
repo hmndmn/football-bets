@@ -1,100 +1,169 @@
+import math
 import pandas as pd
-import numpy as np
 
-def _key_for_row(row) -> str | None:
-    """
-    Map an odds row to a model probability key.
-    - 1X2: p_H / p_D / p_A
-    - OUx.x Over/Under: p_OUx.x_Over / p_OUx.x_Under
-    - AH (with side + line): p_AH_home_{+/-L} or p_AH_away_{+/-L}
-    """
-    market = str(row.get("market",""))
-    sel = str(row.get("selection",""))
-    if market == "1X2":
-        if sel.lower() == "home":
-            return "p_H"
-        if sel.lower() == "away":
-            return "p_A"
-        if sel.lower() == "draw":
-            return "p_D"
-        return None
+# Expected schemas:
+# fixtures: [match_id, league, utc_kickoff, home, away]
+# odds:     [match_id, league, utc_kickoff, market, selection, price, book, home, away]
+# model:    [match_id, league, home, away, p_H, p_D, p_A, p_BTTS_Yes, p_BTTS_No, p_OU{line}_Over, p_OU{line}_Under, ...]
 
-    if market.startswith("OU"):
-        # market looks like OU2.5
-        L = market[2:]
-        if sel.lower() == "over":
-            return f"p_OU{L}_Over"
-        if sel.lower() == "under":
-            return f"p_OU{L}_Under"
-        return None
+REQUIRED_FIXTURE_COLS = ["match_id", "league", "utc_kickoff", "home", "away"]
+REQUIRED_ODDS_COLS     = ["match_id", "league", "utc_kickoff", "market", "selection", "price", "book", "home", "away"]
 
-    if market == "AH":
-        side = str(row.get("side","")).lower()
-        L    = row.get("line", None)
-        if L is None or side not in ("home","away"):
-            return None
+def _ensure_cols(df: pd.DataFrame, req):
+    if df is None:
+        return pd.DataFrame({c: [] for c in req})
+    for c in req:
+        if c not in df.columns:
+            df[c] = "" if c != "price" else pd.NA
+    # coerce price to float when present
+    if "price" in df.columns:
         try:
-            Lf = float(L)
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        except Exception:
+            pass
+    return df
+
+def _implied_prob(price):
+    try:
+        p = 1.0 / float(price)
+        return p if math.isfinite(p) else None
+    except Exception:
+        return None
+
+def _edge(model_p, price):
+    ip = _implied_prob(price)
+    if model_p is None or ip is None:
+        return None
+    return float(model_p) - float(ip)
+
+def _pick_row_common(frow, orow, market, selection, model_p, edge, price):
+    return {
+        "utc_kickoff": frow.get("utc_kickoff", "") or orow.get("utc_kickoff", ""),
+        "match": f"{frow.get('home','')} vs {frow.get('away','')}",
+        "market": market,
+        "selection": selection,
+        "price": price,
+        "book": orow.get("book", ""),
+        "model_prob": model_p if model_p is not None else "",
+        "implied": _implied_prob(price) if price is not None else "",
+        "edge": edge if edge is not None else "",
+        "stake_pct": "",
+        "stake_amt": "",
+        "league": frow.get("league", "") or orow.get("league", ""),
+        "home": frow.get("home", "") or orow.get("home", ""),
+        "away": frow.get("away", "") or orow.get("away", ""),
+        "match_id": frow.get("match_id", "") or orow.get("match_id", ""),
+    }
+
+def _extract_model_prob(model_row: pd.Series, market: str, selection: str):
+    # 1X2
+    if market == "1X2":
+        if selection == "Home":
+            return float(model_row.get("p_H", 0.0))
+        if selection == "Draw":
+            return float(model_row.get("p_D", 0.0))
+        if selection == "Away":
+            return float(model_row.get("p_A", 0.0))
+        return None
+
+    # Totals "OU{line}" where selection is "Over" or "Under"
+    if market.startswith("OU"):
+        try:
+            line = market[2:]
+            key = f"p_OU{line}_{selection}"
+            val = model_row.get(key, None)
+            return float(val) if val is not None else None
         except Exception:
             return None
-        label = f"{Lf:+g}" if side == "home" else f"{Lf:+g}"  # we’ll convert below
-        if side == "home":
-            return f"p_AH_home_{label}"
-        else:
-            # away line in model is stored as p_AH_away_{+/-L} with L as typed for away in odds
-            return f"p_AH_away_{label}"
+
+    # Asian Handicap "AH{handicap}" — basic proxy (can refine later)
+    if market.startswith("AH"):
+        if selection == "Home":
+            return float(model_row.get("p_H", 0.0))
+        if selection == "Away":
+            return float(model_row.get("p_A", 0.0))
+        return None
 
     return None
 
-def implied_from_decimal(price: float) -> float:
-    try:
-        p = float(price)
-        return 1.0 / p if p > 0 else np.nan
-    except Exception:
-        return np.nan
+def find_value_bets(
+    fixtures: pd.DataFrame,
+    odds: pd.DataFrame,
+    model_probs: pd.DataFrame,
+    edge_threshold: float = 0.05,
+    book_filter: str = "",
+    max_picks: int = 50,
+) -> pd.DataFrame:
+    fixtures = _ensure_cols(fixtures, REQUIRED_FIXTURE_COLS)
+    odds     = _ensure_cols(odds, REQUIRED_ODDS_COLS)
 
-def find_value_bets(model_probs: pd.DataFrame, odds: pd.DataFrame, edge_threshold: float = 0.05) -> pd.DataFrame:
-    """
-    Compare model probabilities to book implied. Return rows where edge >= threshold.
-    Output columns: match_id, market, selection, price, book, model_prob, implied, edge, stake_pct, stake_amt
-    (Stake columns are filled later by StakeSizer)
-    """
-    if model_probs.empty or odds.empty:
-        return pd.DataFrame(columns=["match_id","market","selection","price","book","model_prob","implied","edge"])
+    if odds is None or odds.empty or fixtures is None or fixtures.empty:
+        return pd.DataFrame(columns=[
+            "utc_kickoff", "match", "market", "selection", "price", "book",
+            "model_prob", "implied", "edge", "stake_pct", "stake_amt",
+            "league", "home", "away", "match_id"
+        ])
 
-    # Model probs indexed by match_id for quick lookup
-    mp = model_probs.set_index("match_id")
+    # Keep only odds that have a matching fixture (ensures league/home/away present)
+    odds = odds.merge(
+        fixtures[["match_id", "league", "utc_kickoff", "home", "away"]],
+        on="match_id", how="inner", suffixes=("", "_fx")
+    )
 
-    out = []
-    for _, r in odds.iterrows():
-        mid = r.get("match_id")
-        if mid not in mp.index:
+    # Optional book filter
+    if book_filter:
+        bl = book_filter.lower().strip()
+        odds = odds[odds["book"].astype(str).str.lower().str.contains(bl, na=False)]
+
+    # Best price per (match_id, market, selection)
+    odds = (
+        odds.sort_values("price", ascending=False)
+            .drop_duplicates(subset=["match_id", "market", "selection"], keep="first")
+            .reset_index(drop=True)
+    )
+
+    if model_probs is None or model_probs.empty:
+        return pd.DataFrame(columns=[
+            "utc_kickoff", "match", "market", "selection", "price", "book",
+            "model_prob", "implied", "edge", "stake_pct", "stake_amt",
+            "league", "home", "away", "match_id"
+        ])
+
+    # Fast lookup for model rows
+    mp_index = {row["match_id"]: row for _, row in model_probs.iterrows() if "match_id" in row and pd.notna(row["match_id"])}
+
+    picks = []
+    for _, orow in odds.iterrows():
+        mid = orow.get("match_id")
+        frow = orow  # already merged
+        mrow = mp_index.get(mid)
+        if mrow is None:
             continue
-        key = _key_for_row(r)
-        if not key:
-            continue
-        prob = mp.at[mid, key] if key in mp.columns else np.nan
-        implied = implied_from_decimal(r.get("price"))
-        if pd.isna(prob) or pd.isna(implied):
-            continue
-        edge = float(prob) - float(implied)
-        if edge >= edge_threshold:
-            out.append({
-                "match_id": mid,
-                "market": r.get("market"),
-                "selection": r.get("selection"),
-                "price": float(r.get("price")),
-                "book": r.get("book"),
-                "model_prob": float(prob),
-                "implied": float(implied),
-                "edge": float(edge),
-                # carry-through (helpful later)
-                "side": r.get("side"),
-                "line": r.get("line"),
-            })
 
-    if not out:
-        return pd.DataFrame(columns=["match_id","market","selection","price","book","model_prob","implied","edge"])
+        market = str(orow.get("market", ""))
+        sel    = str(orow.get("selection", ""))
+        price  = orow.get("price", None)
 
-    df = pd.DataFrame(out)
-    return df.sort_values(["match_id","edge"], ascending=[True, False]).reset_index(drop=True)
+        mp = _extract_model_prob(mrow, market, sel)
+        eg = _edge(mp, price)
+        if eg is None or eg < float(edge_threshold):
+            continue
+
+        picks.append(_pick_row_common(frow, orow, market, sel, mp, eg, price))
+
+    if not picks:
+        return pd.DataFrame(columns=[
+            "utc_kickoff", "match", "market", "selection", "price", "book",
+            "model_prob", "implied", "edge", "stake_pct", "stake_amt",
+            "league", "home", "away", "match_id"
+        ])
+
+    out = pd.DataFrame(picks).sort_values("edge", ascending=False).head(int(max_picks)).reset_index(drop=True)
+
+    # Clean any non-finite numbers
+    for col in ("model_prob", "implied", "edge"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.replace([float("inf"), float("-inf")], pd.NA)
+
+    return out
