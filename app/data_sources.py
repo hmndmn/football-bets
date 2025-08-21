@@ -1,24 +1,18 @@
 # app/data_sources.py
 import os
-import time
 import math
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
 """
-We fetch BOTH fixtures and odds from The Odds API so we don't depend on API-Football.
-This file guarantees the following schemas:
+Fetch fixtures and odds from The Odds API.
 
 fixtures DF columns:
   ["match_id", "league", "utc_kickoff", "home", "away"]
 
 odds DF columns:
   ["match_id","league","utc_kickoff","market","selection","price","book","home","away"]
-
-Notes:
-- markets handled: 1X2 ("h2h"), Totals -> "OU{line}", Spreads -> "AH{handicap}"
-- We keep the BEST price per (match_id, market, selection) later in markets.py, but here we emit all rows.
 """
 
 # Map our human league names to The Odds API sport_keys
@@ -28,14 +22,13 @@ SPORT_KEY_BY_LEAGUE = {
     "SerieA": "soccer_italy_serie_a",
     "Bundesliga": "soccer_germany_bundesliga",
     "Ligue1": "soccer_france_ligue_one",
-    # add more here if needed
 }
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 REGIONS = os.getenv("ODDS_REGIONS", "uk,eu,us").strip() or "uk,eu,us"
-ODDS_MARKETS = "h2h,totals,spreads"  # 1X2, totals, (asian-like) spreads
+ODDS_MARKETS = "h2h,totals,spreads"  # 1X2, Totals, Spreads
 
 
 def _now_utc():
@@ -49,7 +42,7 @@ def _within_hours(start_iso: str, hours_ahead: int) -> bool:
             dt = dt.replace(tzinfo=timezone.utc)
         return _now_utc() <= dt <= (_now_utc() + timedelta(hours=hours_ahead))
     except Exception:
-        return True  # if parsing fails, don't filter out
+        return True  # if parsing fails, keep it
 
 
 def _safe_float(x):
@@ -66,6 +59,13 @@ def _league_list(leagues):
     if not leagues:
         return []
     return [s.strip() for s in leagues if s and s.strip()]
+
+
+def _try_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"text": resp.text[:500] if hasattr(resp, "text") else ""}
 
 
 def _fetch_odds_api_events(sport_key: str):
@@ -94,18 +94,7 @@ def _fetch_odds_api_events(sport_key: str):
         return None, {"status": 599, "sample": {"error": str(e)}, "headers": {}}
 
 
-def _try_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {"text": resp.text[:500] if hasattr(resp, "text") else ""}
-
-
 def fetch_fixtures(leagues, hours_ahead=168) -> pd.DataFrame:
-    """
-    Build fixtures from the Odds API event list.
-    Returns DF with columns: match_id, league, utc_kickoff, home, away
-    """
     leagues = _league_list(leagues)
     rows = []
 
@@ -139,11 +128,6 @@ def fetch_fixtures(leagues, hours_ahead=168) -> pd.DataFrame:
 
 
 def fetch_odds(leagues) -> pd.DataFrame:
-    """
-    Flatten odds rows from the Odds API for the requested leagues.
-    Output columns:
-      match_id, league, utc_kickoff, market, selection, price, book, home, away
-    """
     leagues = _league_list(leagues)
     out_rows = []
 
@@ -168,10 +152,9 @@ def fetch_odds(leagues) -> pd.DataFrame:
                 for m in mkts:
                     mkey = (m.get("key") or "").lower()
                     outcomes = m.get("outcomes", []) or []
+
                     # 1) 1X2 ("h2h")
                     if mkey == "h2h":
-                        # outcomes typically have names: home team, away team, Draw
-                        # Map to selections "Home", "Away", "Draw" by comparing names.
                         for o in outcomes:
                             oname = str(o.get("name", ""))
                             price = _safe_float(o.get("price"))
@@ -194,7 +177,8 @@ def fetch_odds(leagues) -> pd.DataFrame:
                                     "home": home,
                                     "away": away,
                                 })
-                    # 2) Totals -> "OU{line}" selection Over/Under
+
+                    # 2) Totals -> "OU{line}"
                     elif mkey == "totals":
                         for o in outcomes:
                             side = str(o.get("name","")).capitalize()  # "Over"/"Under"
@@ -213,7 +197,8 @@ def fetch_odds(leagues) -> pd.DataFrame:
                                     "home": home,
                                     "away": away,
                                 })
-                    # 3) Spreads -> treat as Asian Handicap (from home perspective)
+
+                    # 3) Spreads -> treat as Asian Handicap from home perspective
                     elif mkey == "spreads":
                         for o in outcomes:
                             oname = str(o.get("name",""))
@@ -221,9 +206,6 @@ def fetch_odds(leagues) -> pd.DataFrame:
                             price = _safe_float(o.get("price"))
                             if point is None or price is None:
                                 continue
-                            # Normalize to market "AH{point_from_home_perspective}"
-                            # If outcome is home team, selection=Home, market AH{point}
-                            # If outcome is away team, selection=Away, market AH{-point}
                             if oname == home:
                                 market = f"AH{point:g}"
                                 sel = "Home"
@@ -243,12 +225,40 @@ def fetch_odds(leagues) -> pd.DataFrame:
                                 "home": home,
                                 "away": away,
                             })
-                    else:
-                        # ignore other market types
-                        pass
 
     if not out_rows:
         return pd.DataFrame(columns=[
             "match_id","league","utc_kickoff","market","selection","price","book","home","away"
         ])
     return pd.DataFrame(out_rows).reset_index(drop=True)
+
+
+# ---------- Diagnostics helpers ----------
+
+def probe_odds_api(leagues):
+    """Return per-league API status, headers, and a tiny sample (first event)."""
+    leagues = _league_list(leagues)
+    out = {}
+    for lg in leagues:
+        sport_key = SPORT_KEY_BY_LEAGUE.get(lg)
+        if not sport_key:
+            out[lg] = {"status": 400, "error": "unknown_league"}
+            continue
+        events, meta = _fetch_odds_api_events(sport_key)
+        sample = None
+        if isinstance(events, list) and events:
+            ev = events[0]
+            sample = {
+                "home_team": ev.get("home_team"),
+                "away_team": ev.get("away_team"),
+                "commence_time": ev.get("commence_time"),
+                "bookmakers": len(ev.get("bookmakers", []) or []),
+            }
+            # Trim markets for readability
+        out[lg] = {
+            "status": meta.get("status"),
+            "headers": meta.get("headers", {}),
+            "sample": sample if sample else meta.get("sample"),
+            "events": (len(events) if isinstance(events, list) else None),
+        }
+    return out
