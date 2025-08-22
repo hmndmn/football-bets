@@ -1,407 +1,330 @@
-# app/data_sources.py
 import os
 import time
-import datetime as dt
-from typing import Dict, List, Tuple
 import requests
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 
-UTC = dt.timezone.utc
+# -------------------------------
+# Helpers / config
+# -------------------------------
 
-# -----------------------
-# Helpers
-# -----------------------
-def _now_utc() -> dt.datetime:
-    return dt.datetime.now(tz=UTC)
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 
-def _iso(ts: dt.datetime) -> str:
-    return ts.astimezone(UTC).strftime("%Y-%m-%d")
+# e.g. "EPL:39,LaLiga:140,SerieA:135,Bundesliga:78,Ligue1:61"
+APIFOOTBALL_LEAGUES = os.getenv(
+    "APIFOOTBALL_LEAGUES",
+    "EPL:39,LaLiga:140,SerieA:135,Bundesliga:78,Ligue1:61"
+)
 
-def _env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).lower() in ("1", "true", "yes", "y")
+BOOK_FILTER = os.getenv("BOOK_FILTER", "").strip()  # optional: filter to a single book name (e.g., "bet365")
 
-# -----------------------
-# Public API (used by main.py)
-# -----------------------
-def fetch_fixtures(leagues: List[str], hours_ahead: int = 168) -> pd.DataFrame:
+# Which odds markets to extract
+WANTED_MARKETS = {"1X2", "OU2.5", "OU3.5", "AH-0.5", "AH+0.5", "AH-1.0", "AH+1.0"}
+
+# -------------------------------
+# League id mapping
+# -------------------------------
+
+def parse_league_map():
     """
-    Returns DataFrame: [match_id, league, utc_kickoff, home, away]
-    Chooses provider by ODDS_PROVIDER env.
+    Returns dict like {"EPL": "39", "LaLiga": "140", ...}
+    Only includes leagues listed in LEAGUES env if provided.
     """
-    provider = os.getenv("ODDS_PROVIDER", "oddsapi").lower()
-    if provider == "apifootball":
-        return _af_fetch_fixtures(leagues, hours_ahead)
-    else:
-        # We keep the old “events list” from The Odds API as a rough fixture source.
-        return _toa_fetch_fixtures(leagues, hours_ahead)
-
-def fetch_odds(
-    leagues: List[str],
-    fixtures_df: pd.DataFrame,
-    hours_ahead: int = 168,
-) -> pd.DataFrame:
-    """
-    Returns DataFrame: [match_id, league, utc_kickoff, market, selection, price, book, home, away]
-    """
-    provider = os.getenv("ODDS_PROVIDER", "oddsapi").lower()
-    if provider == "apifootball":
-        return _af_fetch_odds(leagues, fixtures_df)
-    else:
-        return _toa_fetch_odds(leagues, fixtures_df, hours_ahead)
-
-# ==========================================================
-# Provider: API-FOOTBALL
-# Docs portal: https://www.api-football.com/documentation-v3
-# We use /fixtures (by date range + league) and /odds (by fixture)
-# ==========================================================
-
-def _af_config() -> Tuple[str, Dict[str, int]]:
-    api_key = os.getenv("APIFOOTBALL_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("APIFOOTBALL_KEY missing")
-    # Map short names to league IDs
-    raw = os.getenv(
-        "APIFOOTBALL_LEAGUES",
-        "EPL:39,LaLiga:140,SerieA:135,Bundesliga:78,Ligue1:61",
-    )
-    id_map: Dict[str, int] = {}
+    raw = APIFOOTBALL_LEAGUES
+    picks = {}
     for part in raw.split(","):
-        k, v = [s.strip() for s in part.split(":")]
-        id_map[k] = int(v)
-    return api_key, id_map
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        name, lid = part.split(":", 1)
+        name = name.strip()
+        lid = lid.strip()
+        picks[name] = lid
 
-def _af_fetch_fixtures(leagues: List[str], hours_ahead: int) -> pd.DataFrame:
-    api_key, id_map = _af_config()
-    base = "https://v3.football.api-sports.io"
-    # Time window
-    start = _now_utc()
-    end = start + dt.timedelta(hours=hours_ahead)
-    from_d = _iso(start)
-    to_d = _iso(end)
+    # apply LEAGUES filter if set (comma-separated), otherwise keep all
+    env_leagues = os.getenv("LEAGUES", "").strip()
+    if env_leagues:
+        wanted = {s.strip() for s in env_leagues.split(",") if s.strip()}
+        picks = {k: v for k, v in picks.items() if k in wanted}
+
+    return picks
+
+# -------------------------------
+# API-Football low-level calls
+# -------------------------------
+
+def af_headers():
+    if not API_FOOTBALL_KEY:
+        raise RuntimeError("API_FOOTBALL_KEY missing")
+    return {"x-apisports-key": API_FOOTBALL_KEY}
+
+def af_get(path: str, params: dict, sleep_sec: float = 0.0):
+    """
+    Simple GET wrapper with tiny throttle to be nice.
+    Raises for HTTP errors; returns parsed json.
+    """
+    if sleep_sec > 0:
+        time.sleep(sleep_sec)
+    url = f"https://v3.football.api-sports.io{path}"
+    r = requests.get(url, headers=af_headers(), params=params, timeout=30)
+    r.raise_for_status()
+    return r.json(), r.headers
+
+# -------------------------------
+# Fixtures (API-Football)
+# -------------------------------
+
+def fetch_fixtures(leagues, hours_ahead=240):
+    """
+    leagues: list like ["EPL","LaLiga",...]
+    Returns DataFrame columns: match_id, league, utc_kickoff, home, away
+    """
+    if not leagues:
+        # derive from map if not provided
+        leagues = list(parse_league_map().keys())
+
+    league_map = parse_league_map()
+    if not league_map:
+        return pd.DataFrame(columns=["match_id","league","utc_kickoff","home","away"])
+
+    now_utc = datetime.now(timezone.utc)
+    to_utc   = now_utc + timedelta(hours=int(hours_ahead))
+    date_from = now_utc.strftime("%Y-%m-%d")
+    date_to   = to_utc.strftime("%Y-%m-%d")
 
     rows = []
-    headers = {"x-apisports-key": api_key}
-
-    for lg in leagues:
-        if lg not in id_map:
+    for lname in leagues:
+        if lname not in league_map:
             continue
-        league_id = id_map[lg]
-        # We call fixtures by league + date range (pre-match)
-        # doc hub: fixtures endpoint supports date or between dates (from/to).
+        lid = league_map[lname]
         params = {
-            "league": league_id,
-            "from": from_d,
-            "to": to_d,
+            "league": lid,
+            "season": now_utc.year,      # season year, e.g. 2025
+            "from": date_from,
+            "to": date_to,
             "timezone": "UTC",
         }
-        r = requests.get(f"{base}/fixtures", headers=headers, params=params, timeout=30)
-        if r.status_code != 200:
-            continue
-        js = r.json()
-        for item in js.get("response", []):
-            fid = str(item.get("fixture", {}).get("id"))
-            date_iso = item.get("fixture", {}).get("date")  # ISO timestamp
-            home = item.get("teams", {}).get("home", {}).get("name")
-            away = item.get("teams", {}).get("away", {}).get("name")
-            # Only upcoming/NS fixtures
-            status_short = item.get("fixture", {}).get("status", {}).get("short", "")
-            if status_short not in ("NS", "TBD", "PST"):  # not started
-                continue
-            rows.append(
-                {
-                    "match_id": fid,
-                    "league": lg,
-                    "utc_kickoff": date_iso,
-                    "home": home,
-                    "away": away,
-                }
-            )
-        # be polite to rate limits
-        time.sleep(0.15)
-
-    df = pd.DataFrame(rows, columns=["match_id", "league", "utc_kickoff", "home", "away"])
-    return df.dropna(subset=["match_id", "home", "away"]).drop_duplicates("match_id")
-
-def _af_fetch_odds(leagues: List[str], fixtures_df: pd.DataFrame) -> pd.DataFrame:
-    api_key, id_map = _af_config()
-    base = "https://v3.football.api-sports.io"
-    headers = {"x-apisports-key": api_key}
-
-    # Markets we care about and their API-Football bet keys (common names).
-    # API-Football standardizes bet names like:
-    # - "Match Winner" (1X2)
-    # - "Goals Over/Under" (totals)
-    # - "Both Teams To Score"
-    # - "Asian Handicap"
-    wanted_bets = {
-        "Match Winner": "1X2",
-        "Goals Over/Under": "OU",
-        "Both Teams To Score": "BTTS",
-        "Asian Handicap": "AH",
-    }
-
-    out_rows = []
-
-    # Build quick lookup for league by match_id
-    league_by_id = {str(r.match_id): r.league for r in fixtures_df.itertuples()}
-
-    for fid in fixtures_df["match_id"].tolist():
-        params = {"fixture": fid, "bookmaker": "", "timezone": "UTC"}
-        r = requests.get(f"{base}/odds", headers=headers, params=params, timeout=30)
-        if r.status_code != 200:
-            time.sleep(0.2)
-            continue
-        js = r.json()
-        for resp in js.get("response", []):
-            # Structure: response[].bookmakers[].name, bets[].name, bets[].values[]
-            for bm in resp.get("bookmakers", []):
-                book = bm.get("name")
-                for bet in bm.get("bets", []):
-                    bet_name = bet.get("name", "")
-                    if bet_name not in wanted_bets:
-                        continue
-                    market_code = wanted_bets[bet_name]
-
-                    # Values structure differs by market; we normalize to (selection, price)
-                    for v in bet.get("values", []):
-                        label = (v.get("value") or v.get("odd") or "").strip()
-                        # API returns price as string under "odd"
-                        price_str = v.get("odd") or v.get("price") or ""
-                        try:
-                            price = float(price_str)
-                        except Exception:
-                            continue
-
-                        selection = None
-                        if bet_name == "Match Winner":
-                            # labels typically "Home", "Draw", "Away" or "1", "X", "2"
-                            lab = label.lower()
-                            if lab in ("home", "1", "1 (home)"):
-                                selection = "Home"
-                            elif lab in ("draw", "x"):
-                                selection = "Draw"
-                            elif lab in ("away", "2", "2 (away)"):
-                                selection = "Away"
-                        elif bet_name == "Goals Over/Under":
-                            # label like "Over 2.5" / "Under 2.5"
-                            selection = label.title()  # keep "Over 2.5" etc
-                            market_code = f"OU{_extract_total_line(label)}"
-                        elif bet_name == "Both Teams To Score":
-                            selection = "Yes" if label.lower().startswith("yes") else "No"
-                        elif bet_name == "Asian Handicap":
-                            # label example: "Home -0.25" / "Away +0.25"
-                            selection = label  # keep original; we display it as-is
-
-                        if not selection:
-                            continue
-
-                        out_rows.append(
-                            {
-                                "match_id": str(fid),
-                                "league": league_by_id.get(str(fid), ""),
-                                "utc_kickoff": resp.get("fixture", {}).get("date"),
-                                "market": market_code,
-                                "selection": selection,
-                                "price": price,
-                                "book": book,
-                            }
-                        )
-
-        time.sleep(0.2)
-
-    if not out_rows:
-        return pd.DataFrame(
-            columns=[
-                "match_id",
-                "league",
-                "utc_kickoff",
-                "market",
-                "selection",
-                "price",
-                "book",
-                "home",
-                "away",
-            ]
-        )
-
-    odds = pd.DataFrame(out_rows)
-    # Attach home/away team names
-    odds = odds.merge(
-        fixtures_df[["match_id", "home", "away"]],
-        on="match_id",
-        how="left",
-    )
-    # Keep best (highest) price per (match, market, selection)
-    odds.sort_values(["match_id", "market", "selection", "price"], ascending=[True, True, True, False], inplace=True)
-    odds = odds.drop_duplicates(subset=["match_id", "market", "selection"], keep="first")
-    return odds.reset_index(drop=True)
-
-def _extract_total_line(label: str) -> str:
-    # Turn "Over 2.5" / "Under 3" into "2.5" / "3"
-    parts = label.strip().split()
-    for p in parts:
         try:
-            float(p.replace(",", "."))
-            return p.replace(",", ".")
+            data, _hdr = af_get("/fixtures", params, sleep_sec=0.15)
         except Exception:
             continue
-    return "?"
 
-# ==========================================================
-# Provider: The Odds API (existing fallback)
-# ==========================================================
-def _toa_key() -> str:
-    return os.getenv("ODDS_API_KEY", "").strip()
+        resp = data.get("response", []) or []
+        for item in resp:
+            fix = item.get("fixture", {})
+            teams = item.get("teams", {})
+            dt = fix.get("date")
+            try:
+                # normalize kickoff to pure UTC ISO Z
+                ts = fix.get("timestamp")
+                if ts:
+                    kickoff = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    kickoff = dt
+            except Exception:
+                kickoff = dt
 
-_TOA_LEAGUE_KEYS = {
-    "EPL": "soccer_epl",
-    "LaLiga": "soccer_spain_la_liga",
-    "SerieA": "soccer_italy_serie_a",
-    "Bundesliga": "soccer_germany_bundesliga",
-    "Ligue1": "soccer_france_ligue_one",
-}
+            rows.append({
+                "match_id": str(fix.get("id")),
+                "league": lname,
+                "utc_kickoff": kickoff,
+                "home": (teams.get("home") or {}).get("name"),
+                "away": (teams.get("away") or {}).get("name"),
+            })
 
-def _toa_fetch_fixtures(leagues: List[str], hours_ahead: int) -> pd.DataFrame:
-    api_key = _toa_key()
-    if not api_key:
-        return pd.DataFrame(columns=["match_id", "league", "utc_kickoff", "home", "away"])
-    base = "https://api.the-odds-api.com/v4/sports"
-    regions = os.getenv("ODDS_REGIONS", "uk,eu,us")
-    end = _now_utc() + dt.timedelta(hours=hours_ahead)
+    df = pd.DataFrame(rows, columns=["match_id","league","utc_kickoff","home","away"])
+    # Drop any null ids
+    df = df[df["match_id"].notna()]
+    return df.reset_index(drop=True)
+
+# -------------------------------
+# Odds (API-Football)
+# -------------------------------
+
+def _map_bet_to_market_and_selection(bet_name: str, value: str):
+    """
+    Map API-Football 'bet' and 'value' into our (market, selection).
+    Returns (market, selection) or (None, None) if not supported.
+    """
+    # 1X2
+    if bet_name.lower() in ("match winner", "1x2"):
+        v = value.strip().lower()
+        if v in ("home", "1"):
+            return ("1X2", "Home")
+        if v in ("draw", "x"):
+            return ("1X2", "Draw")
+        if v in ("away", "2"):
+            return ("1X2", "Away")
+        return (None, None)
+
+    # Over/Under: values like "Over 2.5" / "Under 3.5"
+    if bet_name.lower() in ("over/under", "totals"):
+        parts = value.strip().split()
+        if len(parts) == 2:
+            side, line = parts
+            try:
+                fline = float(line)
+                market = f"OU{fline}"
+                sel = "Over" if side.lower() == "over" else "Under"
+                return (market, sel)
+            except Exception:
+                return (None, None)
+
+    # Asian Handicap: values like "Home -0.5", "Away +1.0"
+    if "asian" in bet_name.lower():
+        parts = value.strip().split()
+        if len(parts) == 2:
+            side, line = parts
+            try:
+                fline = float(line)
+                # normalize to signed with one decimal
+                if fline >= 0:
+                    m = f"AH+{fline:.1f}"
+                else:
+                    m = f"AH{fline:.1f}"
+                sel = "Home" if side.lower() == "home" else "Away"
+                return (m, sel)
+            except Exception:
+                return (None, None)
+
+    return (None, None)
+
+def fetch_odds(fixtures_df: pd.DataFrame, leagues, hours_ahead=240):
+    """
+    Pull odds from API-Football for the given fixtures.
+    Returns DataFrame columns:
+      match_id, league, utc_kickoff, market, selection, price, book, home, away
+    """
+    if fixtures_df is None or fixtures_df.empty:
+        return pd.DataFrame(columns=["match_id","league","utc_kickoff","market","selection","price","book","home","away"])
 
     rows = []
-    for lg in leagues:
-        skey = _TOA_LEAGUE_KEYS.get(lg)
-        if not skey:
-            continue
-        url = f"{base}/{skey}/odds"
-        params = {
-            "regions": regions,
-            "markets": "h2h,totals,spreads",
-            "oddsFormat": "decimal",
-            "apiKey": api_key,
-        }
-        r = requests.get(url, params=params, timeout=25)
-        if r.status_code != 200:
-            continue
-        for ev in r.json():
-            utc = ev.get("commence_time")
-            try:
-                when = dt.datetime.fromisoformat(utc.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if when > end:
-                continue
-            rows.append(
-                {
-                    "match_id": ev.get("id"),
-                    "league": lg,
-                    "utc_kickoff": utc,
-                    "home": ev.get("home_team"),
-                    "away": ev.get("away_team"),
-                }
-            )
-        time.sleep(0.2)
-    df = pd.DataFrame(rows, columns=["match_id", "league", "utc_kickoff", "home", "away"])
-    return df.drop_duplicates("match_id")
+    # Optional bookmaker filter by name (case-insensitive substring)
+    want_book = BOOK_FILTER.lower() if BOOK_FILTER else ""
 
-def _toa_fetch_odds(leagues: List[str], fixtures_df: pd.DataFrame, hours_ahead: int) -> pd.DataFrame:
-    api_key = _toa_key()
-    if not api_key or fixtures_df.empty:
+    # API-Football odds endpoint supports fixture param
+    # We'll request per fixture (7500/day gives us plenty of headroom)
+    fixture_groups = fixtures_df.groupby("match_id", as_index=False).first()
+
+    for _, row in fixture_groups.iterrows():
+        fid = row["match_id"]
+        league = row["league"]
+        kickoff = row["utc_kickoff"]
+        home = row["home"]
+        away = row["away"]
+
+        params = {"fixture": fid}
+        try:
+            data, _hdr = af_get("/odds", params, sleep_sec=0.12)
+        except Exception:
+            continue
+
+        resp = data.get("response", []) or []
+        for item in resp:
+            # item is typically per fixture -> per bookmaker list under 'bookmakers'
+            for bm in (item.get("bookmakers") or []):
+                book_title = bm.get("name") or bm.get("id") or "Book"
+                if want_book and (want_book not in str(book_title).lower()):
+                    continue
+
+                for bet in (bm.get("bets") or []):
+                    bet_name = bet.get("name") or ""
+                    for val in (bet.get("values") or []):
+                        price = val.get("odd")
+                        vlabel = val.get("value")
+                        if price is None or vlabel is None:
+                            continue
+                        try:
+                            price_f = float(price)
+                        except Exception:
+                            # odds come as string — if cannot parse, skip
+                            continue
+
+                        market, selection = _map_bet_to_market_and_selection(bet_name, vlabel)
+                        if market is None or selection is None:
+                            continue
+                        if market not in WANTED_MARKETS:
+                            # keep only our selected set
+                            continue
+
+                        rows.append({
+                            "match_id": str(fid),
+                            "league": league,
+                            "utc_kickoff": kickoff,
+                            "market": market,
+                            "selection": selection,
+                            "price": price_f,
+                            "book": str(book_title),
+                            "home": home,
+                            "away": away,
+                        })
+
+    if not rows:
         return pd.DataFrame(columns=["match_id","league","utc_kickoff","market","selection","price","book","home","away"])
 
-    base = "https://api.the-odds-api.com/v4/sports"
-    regions = os.getenv("ODDS_REGIONS", "uk,eu,us")
+    df = pd.DataFrame(rows, columns=["match_id","league","utc_kickoff","market","selection","price","book","home","away"])
 
-    out_rows = []
-    for lg in leagues:
-        skey = _TOA_LEAGUE_KEYS.get(lg)
-        if not skey:
+    # Keep the best price per (match, market, selection)
+    df.sort_values(["match_id","market","selection","price"], ascending=[True,True,True,False], inplace=True)
+    df = df.groupby(["match_id","market","selection"], as_index=False).first()
+
+    return df.reset_index(drop=True)
+
+# -------------------------------
+# Optional probe route support
+# -------------------------------
+
+def probe_apifootball(leagues, hours_ahead=240):
+    """
+    Lightweight probe to check headers/limits and that fixtures are returned.
+    """
+    league_map = parse_league_map()
+    if not leagues:
+        leagues = list(league_map.keys())
+
+    now_utc = datetime.now(timezone.utc)
+    to_utc   = now_utc + timedelta(hours=int(hours_ahead))
+    date_from = now_utc.strftime("%Y-%m-%d")
+    date_to   = to_utc.strftime("%Y-%m-%d")
+
+    report = {}
+    headers = {}
+    tried = []
+
+    for lname in leagues:
+        lid = league_map.get(lname)
+        if not lid:
             continue
-        url = f"{base}/{skey}/odds"
-        params = {
-            "regions": regions,
-            "markets": "h2h,totals,spreads",
-            "oddsFormat": "decimal",
-            "apiKey": api_key,
-        }
-        r = requests.get(url, params=params, timeout=25)
-        if r.status_code != 200:
-            continue
-        events = r.json()
-        # Build quick lookup of fixture rows for this league
-        ids_for_league = set(fixtures_df.loc[fixtures_df["league"] == lg, "match_id"].astype(str).tolist())
-        for ev in events:
-            mid = ev.get("id")
-            if str(mid) not in ids_for_league:
-                continue
-            utc = ev.get("commence_time")
-            home = ev.get("home_team")
-            away = ev.get("away_team")
-            for bm in ev.get("bookmakers", []):
-                book = bm.get("title")
-                for mk in bm.get("markets", []):
-                    key = mk.get("key")
-                    if key == "h2h":
-                        mkt = "1X2"
-                        for oc in mk.get("outcomes", []):
-                            sel = oc.get("name")
-                            price = oc.get("price")
-                            if sel in (home,):
-                                out_rows.append( _mk(mid, lg, utc, mkt, "Home", price, book, home, away) )
-                            elif sel in (away,):
-                                out_rows.append( _mk(mid, lg, utc, mkt, "Away", price, book, home, away) )
-                            elif sel == "Draw":
-                                out_rows.append( _mk(mid, lg, utc, mkt, "Draw", price, book, home, away) )
-                    elif key == "totals":
-                        # take a couple of common lines if present (2.5, 3.5)
-                        for oc in mk.get("outcomes", []):
-                            name = oc.get("name", "")
-                            point = oc.get("point", None)
-                            price = oc.get("price", None)
-                            if point is None or price is None:
-                                continue
-                            try:
-                                pstr = str(float(point))
-                            except Exception:
-                                pstr = str(point)
-                            if name.lower().startswith("over"):
-                                mkt = f"OU{pstr}"
-                                out_rows.append( _mk(mid, lg, utc, mkt, f"Over {pstr}", price, book, home, away) )
-                            elif name.lower().startswith("under"):
-                                mkt = f"OU{pstr}"
-                                out_rows.append( _mk(mid, lg, utc, mkt, f"Under {pstr}", price, book, home, away) )
-                    elif key == "spreads":
-                        for oc in mk.get("outcomes", []):
-                            name = oc.get("name", "")
-                            point = oc.get("point", None)
-                            price = oc.get("price", None)
-                            if point is None or price is None:
-                                continue
-                            # Normalize to "Home -0.25" / "Away +0.25"
-                            side = "Home" if name == home else ("Away" if name == away else name)
-                            sign = "+" if float(point) > 0 else ""
-                            sel = f"{side} {sign}{point}"
-                            out_rows.append( _mk(mid, lg, utc, "AH", sel, price, book, home, away) )
-        time.sleep(0.25)
+        params = {"league": lid, "season": now_utc.year, "from": date_from, "to": date_to, "timezone": "UTC"}
+        tried.append({lname: {"league_id": lid, "params": params}})
+        try:
+            data, hdr = af_get("/fixtures", params, sleep_sec=0.1)
+            resp = data.get("response", []) or []
+            first_item = (resp[0] if resp else {})
+            headers[lname] = {
+                "status": 200,
+                "x-ratelimit-requests-limit": hdr.get("x-ratelimit-requests-limit"),
+                "x-ratelimit-requests-remaining": hdr.get("x-ratelimit-requests-remaining"),
+            }
+            report[lname] = {
+                "status": 200,
+                "errors": data.get("errors", []),
+                "results_count": data.get("results"),
+                "first_item_sample": first_item,
+                "paging": data.get("paging", {}),
+            }
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", 0)
+            headers[lname] = {"status": status}
+            report[lname] = {"status": status, "errors": [str(e)]}
+        except Exception as e:
+            headers[lname] = {"status": 0}
+            report[lname] = {"status": 0, "errors": [str(e)]}
 
-    if not out_rows:
-        return pd.DataFrame(columns=["match_id","league","utc_kickoff","market","selection","price","book","home","away"])
-    odds = pd.DataFrame(out_rows)
-    # keep best price per (match, market, selection)
-    odds.sort_values(["match_id","market","selection","price"], ascending=[True,True,True,False], inplace=True)
-    odds = odds.drop_duplicates(subset=["match_id","market","selection"], keep="first")
-    return odds.reset_index(drop=True)
-
-def _mk(mid, lg, utc, mkt, sel, price, book, home, away):
     return {
-        "match_id": str(mid),
-        "league": lg,
-        "utc_kickoff": utc,
-        "market": mkt,
-        "selection": sel,
-        "price": float(price),
-        "book": book,
-        "home": home,
-        "away": away,
+        "ok": True,
+        "window": {"from": date_from, "to": date_to},
+        "leagues_tried": tried,
+        "headers": headers,
+        "report": report,
     }
